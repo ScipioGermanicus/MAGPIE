@@ -1,93 +1,145 @@
 from __future__ import annotations
 
 from pathlib import Path
+import gzip
 import json
 import shutil
-from collections import Counter
+from typing import Iterable
 
 FASTA_SUFFIXES = (".fa", ".fna", ".fasta")
+FASTA_GZ_SUFFIXES = (".fa.gz", ".fna.gz", ".fasta.gz")
 
-def _list_fastas(mags: Path) -> list[Path]:
-    return sorted([p for p in mags.iterdir() if p.is_file() and p.suffix.lower() in FASTA_SUFFIXES])
 
-def _read_rename_map(fp: Path) -> dict[str, str]:
+def _is_fasta(p: Path) -> bool:
+    s = p.name.lower()
+    return s.endswith(FASTA_SUFFIXES) or s.endswith(FASTA_GZ_SUFFIXES)
+
+
+def _iter_mag_fastas(mags_dir: Path) -> list[Path]:
+    files = [p for p in mags_dir.iterdir() if p.is_file() and _is_fasta(p)]
+    return sorted(files, key=lambda x: x.name.lower())
+
+
+def _decompress_gz_to_bytes(src_gz: Path) -> bytes:
+    with gzip.open(src_gz, "rb") as f:
+        return f.read()
+
+
+def _read_bytes_from_plain(src: Path) -> bytes:
+    return src.read_bytes()
+
+
+def _write_gz_bytes(dst_gz: Path, data: bytes) -> None:
+    dst_gz.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(dst_gz, "wb") as f:
+        f.write(data)
+
+
+def _as_fna_bytes(src: Path) -> bytes:
     """
-    Read a 2-column TSV with no header: old_id<TAB>new_id
-    """
-    mapping: dict[str, str] = {}
-    for i, line in enumerate(fp.read_text().splitlines(), start=1):
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) != 2:
-            raise ValueError(f"Invalid rename-map at line {i}: expected 2 tab-separated columns, got {len(parts)}")
-        old, new = parts[0].strip(), parts[1].strip()
-        if not old or not new:
-            raise ValueError(f"Invalid rename-map at line {i}: empty old/new id")
-        mapping[old] = new
-    return mapping
+    Read a FASTA file (.fa/.fna/.fasta or gzipped) and return raw bytes.
 
-def prep_step(*, mags: Path, out: Path, rename_map: Path | None, force: bool) -> None:
+    v0.1: no header rewriting; just bytes-in/bytes-out.
+    """
+    name = src.name.lower()
+    if name.endswith(".gz"):
+        return _decompress_gz_to_bytes(src)
+    return _read_bytes_from_plain(src)
+
+
+def prep_step(
+    *,
+    mags: Path,
+    out: Path,
+    rename_map: Path | None,
+    force: bool,
+    # New knobs for your formatting step:
+    sequential_ids: bool = True,
+    out_prefix: str = "MAG",
+    pad: int = 4,
+) -> None:
+    """
+    Prepare MAGs for downstream steps.
+
+    v0.1 behaviour:
+      - copies MAG FASTAs into out/mags/
+      - optionally assigns sequential IDs (MAG0001...) and writes gzipped files
+      - writes a mapping file (id_map.tsv) and a prep_report.json
+    """
     out.mkdir(parents=True, exist_ok=True)
 
     out_mags = out / "mags"
     out_mags.mkdir(parents=True, exist_ok=True)
 
     report_fp = out / "prep_report.json"
-    mapping_fp = out / "rename_map.tsv"
+    map_fp = out / "id_map.tsv"
 
-    if (report_fp.exists() or mapping_fp.exists()) and not force:
+    if (report_fp.exists() or map_fp.exists()) and not force:
         raise FileExistsError(f"{out} already contains prep outputs. Use --force to overwrite.")
 
-    fasta_files = _list_fastas(mags)
-    if not fasta_files:
-        raise ValueError(f"No FASTA files found in: {mags}")
+    files = _iter_mag_fastas(mags)
+    if not files:
+        raise ValueError(f"No MAG FASTA files found in: {mags}")
 
-    # Default genome IDs: input filename stem
-    input_ids = [p.stem for p in fasta_files]
-    dupes = [k for k, v in Counter(input_ids).items() if v > 1]
-    if dupes:
-        raise ValueError(f"Duplicate genome IDs (filename stems) found: {sorted(dupes)}")
+    # For v0.1: ignore rename_map unless you later want it for non-sequential mode
+    # (keeping signature for compatibility with your CLI).
+    if rename_map is not None and sequential_ids:
+        raise ValueError("--rename-map cannot be used together with --sequential-ids in v0.1")
 
-    # Optional renaming
-    user_map: dict[str, str] = _read_rename_map(rename_map) if rename_map else {}
-    # Create final mapping (identity unless renamed)
-    final_map: dict[str, str] = {}
-    for gid in input_ids:
-        final_map[gid] = user_map.get(gid, gid)
+    # Write mapping header
+    map_lines = ["original_filename\tnew_id"]
 
-    # Ensure renamed IDs are unique
-    new_ids = list(final_map.values())
-    dupes_new = [k for k, v in Counter(new_ids).items() if v > 1]
-    if dupes_new:
-        raise ValueError(f"Renaming produced duplicate IDs: {sorted(dupes_new)}")
+    copies: list[dict[str, str]] = []
+    i = 1
+    for src in files:
+        original = src.name
 
-    # Copy files -> out/mags with .fna suffix
-    copied: list[dict[str, str]] = []
-    for p in fasta_files:
-        old_id = p.stem
-        new_id = final_map[old_id]
-        dest = out_mags / f"{new_id}.fna"
-        if dest.exists() and not force:
-            raise FileExistsError(f"Destination exists: {dest} (use --force)")
-        shutil.copy2(p, dest)
-        copied.append({"src": str(p), "dest": str(dest), "old_id": old_id, "new_id": new_id})
+        if sequential_ids:
+            new_id = f"{out_prefix}{i:0{pad}d}"
+            dst = out_mags / f"{new_id}_genomic.fna.gz"
+            data = _as_fna_bytes(src)
+            if dst.exists() and not force:
+                raise FileExistsError(f"Destination exists: {dst} (use --force)")
+            _write_gz_bytes(dst, data)
+        else:
+            # Preserve ID (stem) and standardise suffix to .fna (not gz) for simplicity
+            # You can change this to always .fna.gz if you prefer.
+            new_id = src.stem  # note: for .fa.gz, stem becomes ".fa" -> not ideal; handle below
+            name_lower = src.name.lower()
+            if name_lower.endswith(".fa.gz") or name_lower.endswith(".fna.gz") or name_lower.endswith(".fasta.gz"):
+                # For *.gz, Path.stem strips only ".gz", leaving ".fa" etc. behind.
+                # Normalize by removing the second suffix as well.
+                new_id = src.name[: -len(".gz")]
+                for suff in (".fa", ".fna", ".fasta"):
+                    if new_id.lower().endswith(suff):
+                        new_id = new_id[: -len(suff)]
+                        break
 
-    # Write mapping file (always)
-    lines = [f"{old}\t{new}" for old, new in sorted(final_map.items())]
-    mapping_fp.write_text("\n".join(lines) + "\n")
+            dst = out_mags / f"{new_id}.fna"
+            if dst.exists() and not force:
+                raise FileExistsError(f"Destination exists: {dst} (use --force)")
+            # Just copy bytes (decompress if needed)
+            data = _as_fna_bytes(src)
+            dst.write_bytes(data)
+
+        map_lines.append(f"{original}\t{new_id}")
+        copies.append({"src": str(src), "dest": str(dst), "new_id": new_id})
+        i += 1
+
+    map_fp.write_text("\n".join(map_lines) + "\n", encoding="utf-8")
 
     report = {
         "mags_dir": str(mags),
         "out_dir": str(out),
-        "n_fastas_in": len(fasta_files),
-        "n_fastas_out": len(copied),
-        "rename_map_provided": bool(rename_map),
+        "n_inputs": len(files),
+        "sequential_ids": sequential_ids,
+        "out_prefix": out_prefix if sequential_ids else None,
+        "pad": pad if sequential_ids else None,
         "outputs": {
             "mags_dir": str(out_mags),
-            "rename_map_tsv": str(mapping_fp),
+            "id_map_tsv": str(map_fp),
             "prep_report_json": str(report_fp),
         },
-        "copies": copied,
+        "copies": copies,
     }
-    report_fp.write_text(json.dumps(report, indent=2))
+    report_fp.write_text(json.dumps(report, indent=2), encoding="utf-8")

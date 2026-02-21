@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "magpie"
-version = "0.1.0"
+version = "0.1.1"
 description = "Build a custom PICRUSt2 reference database from metagenome-assembled genomes (MAGs)"
 readme = "README.md"
 requires-python = ">=3.10"
