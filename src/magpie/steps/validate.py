@@ -1,6 +1,8 @@
 from __future__ import annotations
 from pathlib import Path
 import json
+from collections import Counter
+
 
 FASTA_SUFFIXES = (".fa", ".fna", ".fasta")
 
@@ -16,7 +18,7 @@ def validate_step(*, mags: Path, out: Path, force: bool) -> None:
 
     # Minimal checks: unique basenames, non-empty files
     names = [p.stem for p in fasta_files]
-    dupes = sorted({n for n in names if names.count(n) > 1})
+    dupes = sorted([n for n, c in Counter(names).items() if c > 1])
     empty = [str(p) for p in fasta_files if p.stat().st_size == 0]
 
     report = {
