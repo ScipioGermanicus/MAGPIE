@@ -1,63 +1,48 @@
+# src/magpie/util/deps.py
 from __future__ import annotations
 
+from dataclasses import dataclass
 import shutil
 import subprocess
-from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass(frozen=True)
-class ToolStatus:
-    name: str
+class DepCheck:
     found: bool
-    path: str | None
-    version: str | None
-    error: str | None
+    path: Optional[str]
+    version: Optional[str]
+    error: Optional[str]
 
 
-def _run_version(cmd: list[str]) -> tuple[str | None, str | None]:
-    """
-    Try to run a version command. Returns (version, error).
-    """
+def _run_version(cmd: list[str]) -> tuple[Optional[str], Optional[str]]:
     try:
         p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except Exception as e:  # e.g., permission issues
-        return None, f"{type(e).__name__}: {e}"
-
+    except Exception as e:
+        return None, str(e)
     out = (p.stdout or "").strip()
     err = (p.stderr or "").strip()
-
-    if p.returncode != 0:
-        # Some tools print version to stderr even on non-zero; still capture it.
-        msg = err or out or f"non-zero exit code {p.returncode}"
-        return None, msg
-
-    # GTDB-Tk often prints version to stdout, but be tolerant.
-    return (out or err or None), None
+    # Some tools write version to stderr; prefer stdout but fall back.
+    txt = out if out else err
+    if p.returncode != 0 and not txt:
+        return None, f"non-zero exit ({p.returncode})"
+    return txt.splitlines()[0] if txt else None, None
 
 
-def check_gtdbtk() -> ToolStatus:
-    path = shutil.which("gtdbtk")
+def check_gtdbtk() -> DepCheck:
+    exe = "gtdbtk"
+    path = shutil.which(exe)
     if not path:
-        return ToolStatus(
-            name="gtdbtk",
-            found=False,
-            path=None,
-            version=None,
-            error="Not found on PATH.",
-        )
+        return DepCheck(found=False, path=None, version=None, error="not found on PATH")
+    version, err = _run_version([exe, "--version"])
+    return DepCheck(found=True, path=path, version=version, error=err)
 
-    # Best-effort version detection
-    # GTDB-Tk generally supports `gtdbtk --version`.
-    version, verr = _run_version(["gtdbtk", "--version"])
 
-    # If version is very verbose, keep first line
-    if version:
-        version = version.splitlines()[0].strip()
-
-    return ToolStatus(
-        name="gtdbtk",
-        found=True,
-        path=path,
-        version=version,
-        error=verr,
-    )
+def check_checkm() -> DepCheck:
+    exe = "checkm"
+    path = shutil.which(exe)
+    if not path:
+        return DepCheck(found=False, path=None, version=None, error="not found on PATH")
+    # CheckM supports '--version' in many installs; if it fails, we still mark found=True.
+    version, err = _run_version([exe, "--version"])
+    return DepCheck(found=True, path=path, version=version, error=err)

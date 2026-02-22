@@ -5,12 +5,19 @@ from collections import Counter
 import json
 from pathlib import Path
 
-from ..util.deps import check_gtdbtk
+from ..util.deps import check_gtdbtk, check_checkm
 
 FASTA_SUFFIXES = (".fa", ".fna", ".fasta", ".fa.gz", ".fna.gz", ".fasta.gz")
 
 
-def validate_step(*, mags: Path, out: Path, force: bool, require_gtdbtk: bool = False) -> None:
+def validate_step(
+    *,
+    mags: Path,
+    out: Path,
+    force: bool,
+    require_gtdbtk: bool = False,
+    require_checkm: bool = False,
+) -> None:
     out.mkdir(parents=True, exist_ok=True)
     report_fp = out / "report.json"
     if report_fp.exists() and not force:
@@ -43,15 +50,23 @@ def validate_step(*, mags: Path, out: Path, force: bool, require_gtdbtk: bool = 
     empty = [str(p) for p in fasta_files if p.stat().st_size == 0]
     suffix_counts = dict(Counter([(".gz" if p.name.lower().endswith(".gz") else p.suffix.lower()) for p in fasta_files]))
 
-    # Dependency checks (GTDB-Tk only for now)
+    # Dependency checks
     gtdb = check_gtdbtk()
+    checkm = check_checkm()
+
     dependencies = {
         "gtdbtk": {
             "found": gtdb.found,
             "path": gtdb.path,
             "version": gtdb.version,
             "error": gtdb.error,
-        }
+        },
+        "checkm": {
+            "found": checkm.found,
+            "path": checkm.path,
+            "version": checkm.version,
+            "error": checkm.error,
+        },
     }
 
     if require_gtdbtk and not gtdb.found:
@@ -59,6 +74,13 @@ def validate_step(*, mags: Path, out: Path, force: bool, require_gtdbtk: bool = 
             "GTDB-Tk (gtdbtk) not found on PATH. "
             "Install it (e.g., conda/mamba) and re-run. "
             "Example: `conda install -c conda-forge -c bioconda gtdbtk`."
+        )
+
+    if require_checkm and not checkm.found:
+        raise RuntimeError(
+            "CheckM (checkm) not found on PATH. "
+            "Install it (e.g., conda/mamba) and re-run. "
+            "Example: `conda install -c conda-forge -c bioconda checkm-genome`."
         )
 
     report = {
@@ -70,5 +92,6 @@ def validate_step(*, mags: Path, out: Path, force: bool, require_gtdbtk: bool = 
         "empty_files": empty,
         "dependencies": dependencies,
         "require_gtdbtk": require_gtdbtk,
+        "require_checkm": require_checkm,
     }
     report_fp.write_text(json.dumps(report, indent=2), encoding="utf-8")
