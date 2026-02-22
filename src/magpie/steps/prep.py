@@ -54,7 +54,7 @@ def prep_step(
     rename_map: Path | None,
     force: bool,
     # New knobs for your formatting step:
-    sequential_ids: bool = True,
+    sequential_ids: bool = False,
     out_prefix: str = "MAG",
     pad: int = 4,
 ) -> None:
