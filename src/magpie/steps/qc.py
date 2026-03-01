@@ -1,239 +1,279 @@
+# src/magpie/steps/qc.py
 from __future__ import annotations
 
-import csv
-import logging
-import os
-import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+import csv
+import json
+import re
+import shutil
+from typing import Dict, Iterable, List, Optional, Tuple
 
-from .checkm import checkm_step
-
-_LOGGER = logging.getLogger("magpie.qc")
-
-PlaceMode = Literal["copy", "symlink", "hardlink"]
-
-
-def _ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+from magpie.util.shell import run as shell_run
 
 
-def _read_domain_map(domain_map_tsv: Path) -> dict[str, str]:
+SEP_RE = re.compile(r"^\s*-{5,}\s*$")
+SPLIT_RE = re.compile(r"\s{2,}")  # CheckM QA tables align with >=2 spaces
+
+
+@dataclass(frozen=True)
+class CheckMRow:
+    genome_id: str
+    marker_lineage: str
+    completeness: float
+    contamination: float
+
+
+def _read_domain_map(domain_map_tsv: Path) -> Dict[str, str]:
     """
-    Expect a TSV with at least: genome_id, domain
-    (If your taxonomy uses user_genome instead of genome_id, we accept that.)
+    domain_map.tsv written by taxonomy step.
+    Expected columns: genome_id \t domain
+    (If yours uses different headers, update here.)
     """
-    mapping: dict[str, str] = {}
-    with open(domain_map_tsv, "r", encoding="utf-8", newline="") as fh:
-        r = csv.DictReader(fh, delimiter="\t")
-        if r.fieldnames is None:
-            raise ValueError(f"domain_map.tsv has no header: {domain_map_tsv}")
-
-        gid_key = "genome_id" if "genome_id" in r.fieldnames else ("user_genome" if "user_genome" in r.fieldnames else None)
-        dom_key = "domain" if "domain" in r.fieldnames else None
-        if gid_key is None or dom_key is None:
-            raise ValueError(f"domain_map.tsv must contain genome_id (or user_genome) and domain. Found: {r.fieldnames}")
-
-        for row in r:
-            gid = (row.get(gid_key) or "").strip()
-            dom = (row.get(dom_key) or "").strip()
-            if gid and dom:
-                mapping[gid] = dom
-
-    if not mapping:
-        raise ValueError(f"No entries read from domain_map.tsv: {domain_map_tsv}")
-    return mapping
+    domain_by_id: Dict[str, str] = {}
+    with domain_map_tsv.open("r", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        # try common keys
+        genome_key = "genome_id" if "genome_id" in reader.fieldnames else "Genome"
+        domain_key = "domain" if "domain" in reader.fieldnames else "Domain"
+        if genome_key not in reader.fieldnames or domain_key not in reader.fieldnames:
+            raise ValueError(f"domain_map.tsv missing expected columns. Found: {reader.fieldnames}")
+        for row in reader:
+            gid = (row.get(genome_key) or "").strip()
+            dom = (row.get(domain_key) or "").strip()
+            if gid:
+                domain_by_id[gid] = dom
+    return domain_by_id
 
 
-def _read_checkm_min(checkm_min_tsv: Path) -> dict[str, tuple[float, float]]:
-    out: dict[str, tuple[float, float]] = {}
-    with open(checkm_min_tsv, "r", encoding="utf-8", newline="") as fh:
-        r = csv.DictReader(fh, delimiter="\t")
-        if r.fieldnames is None:
-            raise ValueError(f"CheckM TSV has no header: {checkm_min_tsv}")
-        need = {"genome_id", "checkm_completeness", "checkm_contamination"}
-        if not need.issubset(set(r.fieldnames)):
-            raise ValueError(f"CheckM TSV must contain {sorted(need)}. Found: {r.fieldnames}")
+def parse_checkm_qa_table(tsv_like: Path) -> List[CheckMRow]:
+    """
+    Parse CheckM QA (-o 2) wide table (space-aligned).
+    Works with the style you pasted (Bin Id, Marker lineage, ..., Completeness, Contamination, ...).
+    """
+    header_cols: Optional[List[str]] = None
+    idx_comp = idx_cont = None
 
-        for row in r:
-            gid = (row.get("genome_id") or "").strip()
-            if not gid:
+    rows: List[CheckMRow] = []
+
+    with tsv_like.open("r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.rstrip("\n")
+            s = line.strip()
+            if not s:
                 continue
+            if SEP_RE.match(s):
+                continue
+
+            # Header line
+            if s.startswith("Bin Id"):
+                header_cols = SPLIT_RE.split(s)
+                # locate indices defensively
+                try:
+                    idx_comp = header_cols.index("Completeness")
+                    idx_cont = header_cols.index("Contamination")
+                except ValueError as e:
+                    raise ValueError(f"Could not locate Completeness/Contamination in header: {header_cols}") from e
+                continue
+
+            # Data lines should start with a genome id token
+            if header_cols is None or idx_comp is None or idx_cont is None:
+                # Not yet seen header; skip until we do
+                continue
+
+            parts = SPLIT_RE.split(s)
+            # parts should have at least up to contamination index
+            if len(parts) <= max(idx_comp, idx_cont):
+                continue
+
+            genome_id = parts[0].strip()
+            marker_lineage = parts[1].strip() if len(parts) > 1 else ""
+
             try:
-                cpl = float((row.get("checkm_completeness") or "").strip())
-                cnt = float((row.get("checkm_contamination") or "").strip())
+                completeness = float(parts[idx_comp])
+                contamination = float(parts[idx_cont])
             except ValueError:
+                # If the row is malformed, skip it rather than crashing
                 continue
-            out[gid] = (cpl, cnt)
 
-    if not out:
-        raise ValueError(f"No parsable rows in CheckM TSV: {checkm_min_tsv}")
-    return out
+            rows.append(CheckMRow(
+                genome_id=genome_id,
+                marker_lineage=marker_lineage,
+                completeness=completeness,
+                contamination=contamination
+            ))
 
-
-def _place_file(src: Path, dst: Path, mode: PlaceMode) -> None:
-    _ensure_dir(dst.parent)
-    if dst.exists():
-        return
-    try:
-        if mode == "copy":
-            shutil.copy2(src, dst)
-        elif mode == "symlink":
-            os.symlink(src, dst)
-        elif mode == "hardlink":
-            os.link(src, dst)
-        else:
-            raise ValueError(f"Unknown place mode: {mode}")
-    except OSError as e:
-        _LOGGER.warning("Link failed (%s). Falling back to copy: %s -> %s", e, src, dst)
-        shutil.copy2(src, dst)
-
-
-def _index_split_dir(d: Path) -> dict[str, Path]:
-    """
-    Map genome_id -> file path, assuming filename stem == genome_id.
-    Handles dotted IDs correctly (Path(stem) preserves dots).
-    """
-    idx: dict[str, Path] = {}
-    for p in d.iterdir():
-        if not p.is_file():
+    # de-dup by genome_id (keep first)
+    seen = set()
+    dedup: List[CheckMRow] = []
+    for r in rows:
+        if r.genome_id in seen:
             continue
-        name = p.name
-        if name.lower().endswith(".gz"):
-            name = name[:-3]
-        gid = Path(name).stem
-        idx[gid] = p
-    return idx
+        seen.add(r.genome_id)
+        dedup.append(r)
+
+    if not dedup:
+        raise ValueError(f"No rows parsed from CheckM QA table: {tsv_like}")
+
+    return dedup
+
+
+def write_tsv(path: Path, header: List[str], rows: Iterable[List[str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh, delimiter="\t")
+        w.writerow(header)
+        for r in rows:
+            w.writerow(r)
+
+
+def place_bins(
+    kept_ids: List[str],
+    src_dir: Path,
+    dst_dir: Path,
+    mode: str = "symlink",  # symlink | copy | hardlink
+) -> Tuple[int, List[str]]:
+    """
+    Place genomes by EXACT filename stem match inside src_dir.
+    No fuzzy matching. If a genome isn't found, it is reported missing.
+    """
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build an index of exact stems in src_dir (non-recursive, because taxonomy already split)
+    index: Dict[str, Path] = {}
+    for p in src_dir.iterdir():
+        if p.is_file():
+            index[p.stem] = p
+
+    placed = 0
+    missing: List[str] = []
+
+    for gid in kept_ids:
+        src = index.get(gid)
+        if src is None:
+            missing.append(gid)
+            continue
+
+        dst = dst_dir / src.name
+        if dst.exists():
+            continue
+
+        try:
+            if mode == "symlink":
+                dst.symlink_to(src)
+            elif mode == "hardlink":
+                dst.hardlink_to(src)
+            elif mode == "copy":
+                shutil.copy2(src, dst)
+            else:
+                raise ValueError(f"Unknown placement mode: {mode}")
+        except OSError:
+            # On HPC / Windows, symlinks may fail; fall back to copy for link modes
+            if mode in ("symlink", "hardlink"):
+                shutil.copy2(src, dst)
+            else:
+                raise
+
+        placed += 1
+
+    return placed, missing
 
 
 def qc_step(
     *,
-    tax_dir: Path,
+    checkm_qa: Path,
+    domain_map: Path,
+    bacteria_dir: Path,
+    archaea_dir: Path,
     out: Path,
-    cpus: int,
-    force: bool,
-    checkm_results: Path | None,
-    completeness_min: float,
-    contamination_max: float,
-    place_mode: str,
-    checkm_bin: str = "checkm",
+    completeness_min: float = 90.0,
+    contamination_max: float = 10.0,
+    place_mode: str = "symlink",
+    force: bool = False,
 ) -> None:
-    tax_dir = tax_dir.resolve()
-    out = out.resolve()
+    out.mkdir(parents=True, exist_ok=True)
 
-    if place_mode not in ("copy", "symlink", "hardlink"):
-        raise ValueError("--place-mode must be one of: copy, symlink, hardlink")
+    # Basic overwrite policy
+    out_all = out / "checkm_clean_all.tsv"
+    out_filt = out / "checkm_filtered.tsv"
+    if (out_all.exists() or out_filt.exists()) and not force:
+        raise FileExistsError(f"QC outputs exist under {out}. Use --force to overwrite.")
 
-    # Your actual taxonomy outputs
-    domain_map_fp = tax_dir / "domain_map.tsv"
-    split_root = tax_dir / "genomes_to_search_barrnap"
-    bac_dir = split_root / "bacteria"
-    arc_dir = split_root / "archaea"
+    domain_by_id = _read_domain_map(domain_map)
 
-    if not domain_map_fp.exists():
-        raise FileNotFoundError(f"Expected taxonomy output not found: {domain_map_fp}")
-    if not bac_dir.is_dir():
-        raise FileNotFoundError(f"Expected taxonomy split dir not found: {bac_dir}")
-    if not arc_dir.is_dir():
-        raise FileNotFoundError(f"Expected taxonomy split dir not found: {arc_dir}")
+    rows = parse_checkm_qa_table(checkm_qa)
 
-    _ensure_dir(out)
+    # Strict join: require every CheckM genome_id to exist in domain_map (fail early on ambiguity)
+    merged = []
+    missing_in_domain = []
+    for r in rows:
+        dom = domain_by_id.get(r.genome_id)
+        if dom is None:
+            missing_in_domain.append(r.genome_id)
+            continue
+        merged.append((r, dom))
 
-    # Run CheckM unless user provided merged results
-    if checkm_results is None:
-        merged_min = checkm_step(
-            bacteria_dir=bac_dir,
-            archaea_dir=arc_dir,
-            out=out / "checkm",
-            cpus=cpus,
-            force=force,
-            checkm_bin=checkm_bin,
-        )
-    else:
-        merged_min = checkm_results
-
-    domain_map = _read_domain_map(domain_map_fp)
-    checkm = _read_checkm_min(merged_min)
-
-    # Strict ID policy: CheckM IDs must exist in domain_map
-    missing_in_domain_map = sorted(set(checkm.keys()) - set(domain_map.keys()))
-    if missing_in_domain_map:
+    if missing_in_domain:
+        # This is consistent with your "fail early on ambiguity"
+        missing_preview = ", ".join(missing_in_domain[:10])
         raise ValueError(
-            "CheckM produced genome IDs that are missing from domain_map.tsv (ID mismatch). "
-            f"First few: {missing_in_domain_map[:10]}"
+            f"{len(missing_in_domain)} CheckM IDs not present in domain_map.tsv "
+            f"(first 10: {missing_preview}). This usually means an ID mismatch between "
+            f"prepared genomes and CheckM input."
         )
 
-    # Build rows + filter
-    rows_all: list[dict[str, str]] = []
-    rows_keep: list[dict[str, str]] = []
-
-    for gid, (cpl, cnt) in checkm.items():
-        dom = domain_map[gid]
-        rec = {
-            "genome_id": gid,
-            "domain": dom,
-            "checkm_completeness": f"{cpl:.3f}",
-            "checkm_contamination": f"{cnt:.3f}",
-        }
-        rows_all.append(rec)
-        if cpl >= completeness_min and cnt <= contamination_max:
-            rows_keep.append(rec)
-
-    _LOGGER.info(
-        "QC filter kept %d/%d genomes (completeness>=%.1f, contamination<=%.1f).",
-        len(rows_keep),
-        len(rows_all),
-        completeness_min,
-        contamination_max,
+    # Write all parsed (clean)
+    write_tsv(
+        out_all,
+        header=["genome_id", "marker_lineage", "checkm_completeness", "checkm_contamination", "domain"],
+        rows=[
+            [r.genome_id, r.marker_lineage, f"{r.completeness:.2f}", f"{r.contamination:.2f}", dom]
+            for (r, dom) in merged
+        ],
     )
 
-    # Write tables
-    out_all = out / "checkm_clean_all.tsv"
-    out_keep = out / "checkm_filtered.tsv"
-    for fp, rows in ((out_all, rows_all), (out_keep, rows_keep)):
-        with open(fp, "w", encoding="utf-8", newline="") as fh:
-            w = csv.DictWriter(
-                fh,
-                delimiter="\t",
-                fieldnames=["genome_id", "domain", "checkm_completeness", "checkm_contamination"],
-            )
-            w.writeheader()
-            w.writerows(rows)
+    # Filter
+    kept = [
+        (r, dom) for (r, dom) in merged
+        if r.completeness >= completeness_min and r.contamination <= contamination_max
+    ]
 
-    # Write ID lists
-    bac_ids = sorted({r["genome_id"] for r in rows_keep if r["domain"].lower().startswith("bact")})
-    arc_ids = sorted({r["genome_id"] for r in rows_keep if r["domain"].lower().startswith("arch")})
+    write_tsv(
+        out_filt,
+        header=["genome_id", "marker_lineage", "checkm_completeness", "checkm_contamination", "domain"],
+        rows=[
+            [r.genome_id, r.marker_lineage, f"{r.completeness:.2f}", f"{r.contamination:.2f}", dom]
+            for (r, dom) in kept
+        ],
+    )
+
+    # ID lists
+    bac_ids = sorted({r.genome_id for (r, dom) in kept if dom.lower().startswith("bact")})
+    arc_ids = sorted({r.genome_id for (r, dom) in kept if dom.lower().startswith("arch")})
+
     (out / "bacteria.txt").write_text("\n".join(bac_ids) + ("\n" if bac_ids else ""), encoding="utf-8")
     (out / "archaea.txt").write_text("\n".join(arc_ids) + ("\n" if arc_ids else ""), encoding="utf-8")
 
-    # Place genomes from taxonomy split dirs
+    # Optional bins placement (exact IDs only)
     bins_root = out / "bins"
-    dst_bac = bins_root / "bacteria"
-    dst_arc = bins_root / "archaea"
-    _ensure_dir(dst_bac)
-    _ensure_dir(dst_arc)
+    placed_bac, miss_bac = place_bins(bac_ids, bacteria_dir, bins_root / "bacteria", mode=place_mode)
+    placed_arc, miss_arc = place_bins(arc_ids, archaea_dir, bins_root / "archaea", mode=place_mode)
 
-    bac_idx = _index_split_dir(bac_dir)
-    arc_idx = _index_split_dir(arc_dir)
-
-    missing_files: list[str] = []
-
-    for gid in bac_ids:
-        src = bac_idx.get(gid)
-        if src is None:
-            missing_files.append(gid)
-            continue
-        _place_file(src, dst_bac / src.name, mode=place_mode)
-
-    for gid in arc_ids:
-        src = arc_idx.get(gid)
-        if src is None:
-            missing_files.append(gid)
-            continue
-        _place_file(src, dst_arc / src.name, mode=place_mode)
-
-    if missing_files:
-        raise ValueError(
-            "Filtered genome IDs could not be resolved to files in taxonomy split dirs. "
-            f"First few: {missing_files[:10]}"
-        )
+    # Write a small report/manifest
+    report = {
+        "inputs": {
+            "checkm_qa": str(checkm_qa),
+            "domain_map": str(domain_map),
+            "bacteria_dir": str(bacteria_dir),
+            "archaea_dir": str(archaea_dir),
+        },
+        "thresholds": {
+            "completeness_min": completeness_min,
+            "contamination_max": contamination_max,
+        },
+        "kept": {"bacteria": len(bac_ids), "archaea": len(arc_ids), "total": len(kept)},
+        "placed": {"bacteria": placed_bac, "archaea": placed_arc},
+        "missing_files": {"bacteria": miss_bac[:20], "archaea": miss_arc[:20]},
+        "placement_mode": place_mode,
+    }
+    (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
