@@ -27,6 +27,9 @@ def run_cmd(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
 ) -> None:
+    """
+    Execute a shell command and raise ShellError if it fails.
+    """
     p = subprocess.run(
         list(cmd),
         cwd=str(cwd) if cwd else None,
@@ -37,3 +40,16 @@ def run_cmd(
     )
     if p.returncode != 0:
         raise ShellError(list(cmd), p.returncode, p.stdout, p.stderr)
+
+
+def run(
+    cmd: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> None:
+    """
+    Compatibility wrapper used by MAGPIE steps.
+    Allows importing `run` while keeping the original run_cmd implementation.
+    """
+    run_cmd(cmd, cwd=cwd, env=env)
