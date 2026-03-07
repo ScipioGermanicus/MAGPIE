@@ -11,6 +11,7 @@ from .steps.gtdbtk import gtdbtk_step
 from .steps.taxonomy import taxonomy_step
 from .steps.qc import qc_step
 from .steps.barrnap import barrnap_step
+from .steps.rrna import rrna_step
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -63,7 +64,7 @@ def _validate_checkm_reuse_args(
             raise typer.BadParameter("Use either --checkm-qa OR --checkm-qa-bacteria/--checkm-qa-archaea, not both.")
 
     if (checkm_qa_bacteria is None) ^ (checkm_qa_archaea is None):
-        pass
+        raise typer.BadParameter("Provide both --checkm-qa-bacteria and --checkm-qa-archaea together.")
 
 
 @app.command("run")
@@ -88,7 +89,7 @@ def cmd_run(
         resolve_path=True,
         help="Path to an existing GTDB-Tk classify/ directory. If provided, GTDB-Tk is skipped.",
     ),
-    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for GTDB-Tk / CheckM / Barrnap (if run)."),
+    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for GTDB-Tk / CheckM / Barrnap / VSEARCH (if run)."),
 
     # taxonomy options
     move_tax_split: bool = typer.Option(
@@ -155,10 +156,16 @@ def cmd_run(
     barrnap_bin: str = typer.Option("barrnap", "--barrnap-bin", help="Barrnap executable name or path."),
     barrnap_reject: float = typer.Option(0.8, "--barrnap-reject", min=0.0, max=1.0),
 
+    # rrna / 16S options
+    skip_rrna: bool = typer.Option(False, "--skip-rrna", help="Stop after Barrnap (do not run 16S copy counting/clustering)."),
+    vsearch_bin: str = typer.Option("vsearch", "--vsearch-bin", help="VSEARCH executable name or path."),
+    multi_cluster_id: float = typer.Option(0.90, "--multi-cluster-id", min=0.0, max=1.0, help="Identity for per-genome clustering of multi-copy 16S hits."),
+    final_cluster_id: float = typer.Option(1.0, "--final-cluster-id", min=0.0, max=1.0, help="Identity for final clustering across genome representatives."),
+
     force: bool = typer.Option(False, "--force"),
 ) -> None:
     """
-    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc -> barrnap).
+    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc -> barrnap -> rrna).
     """
     _validate_checkm_reuse_args(
         checkm_qa=checkm_qa,
@@ -173,6 +180,7 @@ def cmd_run(
     tax_dir = out / "04_taxonomy"
     qc_dir = out / "05_qc"
     barrnap_dir = out / "06_barrnap"
+    rrna_dir = out / "07_rrna"
 
     _LOGGER.info("Running MAGPIE workflow in: %s", out)
 
@@ -185,7 +193,7 @@ def cmd_run(
     )
     require_checkm = (not skip_qc) and (not reuse_provided)
 
-    _LOGGER.info("Step 1/6: validate -> %s", validate_dir)
+    _LOGGER.info("Step 1/7: validate -> %s", validate_dir)
     validate_step(
         mags=mags,
         out=validate_dir,
@@ -194,7 +202,7 @@ def cmd_run(
         require_checkm=require_checkm,
     )
 
-    _LOGGER.info("Step 2/6: prep -> %s", prep_dir)
+    _LOGGER.info("Step 2/7: prep -> %s", prep_dir)
     prep_step(
         mags=mags,
         out=prep_dir,
@@ -207,7 +215,7 @@ def cmd_run(
 
     prepared_mags_dir = prep_dir / "mags"
 
-    _LOGGER.info("Step 3/6: gtdbtk (or reuse) -> %s", gtdb_dir)
+    _LOGGER.info("Step 3/7: gtdbtk (or reuse) -> %s", gtdb_dir)
     classify_dir = gtdbtk_step(
         mags_dir=prepared_mags_dir,
         out=gtdb_dir,
@@ -216,7 +224,7 @@ def cmd_run(
         force=force,
     )
 
-    _LOGGER.info("Step 4/6: taxonomy -> %s", tax_dir)
+    _LOGGER.info("Step 4/7: taxonomy -> %s", tax_dir)
     taxonomy_step(
         prep_dir=prep_dir,
         classify_dir=classify_dir,
@@ -229,7 +237,7 @@ def cmd_run(
         _LOGGER.warning("Skipping QC (--skip-qc). Pipeline stops after taxonomy.")
         return
 
-    _LOGGER.info("Step 5/6: qc -> %s", qc_dir)
+    _LOGGER.info("Step 5/7: qc -> %s", qc_dir)
     qc_step(
         tax_dir=tax_dir,
         out=qc_dir,
@@ -249,7 +257,7 @@ def cmd_run(
         _LOGGER.warning("Skipping Barrnap (--skip-barrnap). Pipeline stops after QC.")
         return
 
-    _LOGGER.info("Step 6/6: barrnap -> %s", barrnap_dir)
+    _LOGGER.info("Step 6/7: barrnap -> %s", barrnap_dir)
     barrnap_step(
         qc_dir=qc_dir,
         out=barrnap_dir,
@@ -257,6 +265,21 @@ def cmd_run(
         force=force,
         barrnap_bin=barrnap_bin,
         reject=barrnap_reject,
+    )
+
+    if skip_rrna:
+        _LOGGER.warning("Skipping rrna (--skip-rrna). Pipeline stops after Barrnap.")
+        return
+
+    _LOGGER.info("Step 7/7: rrna -> %s", rrna_dir)
+    rrna_step(
+        barrnap_dir=barrnap_dir,
+        out=rrna_dir,
+        cpus=cpus,
+        force=force,
+        vsearch_bin=vsearch_bin,
+        multi_cluster_id=multi_cluster_id,
+        final_cluster_id=final_cluster_id,
     )
 
     _LOGGER.info("MAGPIE run complete.")
@@ -352,6 +375,44 @@ def cmd_barrnap(
         force=force,
         barrnap_bin=barrnap_bin,
         reject=barrnap_reject,
+    )
+
+
+@app.command("rrna")
+def cmd_rrna(
+    barrnap_dir: Path = typer.Option(
+        ...,
+        "--barrnap-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE Barrnap output directory (e.g. out/06_barrnap).",
+    ),
+    out: Path = typer.Option(
+        ...,
+        "--out",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        help="Output directory for 16S copy counting / clustering artefacts (e.g. out/07_rrna).",
+    ),
+    cpus: int = typer.Option(8, "--cpus", min=1, help="Threads for VSEARCH."),
+    vsearch_bin: str = typer.Option("vsearch", "--vsearch-bin", help="VSEARCH executable name or path."),
+    multi_cluster_id: float = typer.Option(0.90, "--multi-cluster-id", min=0.0, max=1.0, help="Identity for per-genome clustering of multi-copy 16S hits."),
+    final_cluster_id: float = typer.Option(1.0, "--final-cluster-id", min=0.0, max=1.0, help="Identity for final clustering across genome representatives."),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Count, cluster, and select representative 16S genes from Barrnap outputs."""
+    rrna_step(
+        barrnap_dir=barrnap_dir,
+        out=out,
+        cpus=cpus,
+        force=force,
+        vsearch_bin=vsearch_bin,
+        multi_cluster_id=multi_cluster_id,
+        final_cluster_id=final_cluster_id,
     )
 
 
