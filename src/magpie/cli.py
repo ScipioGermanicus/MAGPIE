@@ -10,6 +10,7 @@ from .steps.prep import prep_step
 from .steps.gtdbtk import gtdbtk_step
 from .steps.taxonomy import taxonomy_step
 from .steps.qc import qc_step
+from .steps.barrnap import barrnap_step
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -53,10 +54,6 @@ def _validate_checkm_reuse_args(
     checkm_qa_archaea: Path | None,
     checkm_results: Path | None,
 ) -> None:
-    # Mutually exclusive sources:
-    # - single merged QA
-    # - two QA files (bac+arc, bac-only, arc-only)
-    # - legacy minimal TSV
     if checkm_results is not None:
         if checkm_qa is not None or checkm_qa_bacteria is not None or checkm_qa_archaea is not None:
             raise typer.BadParameter("Use either --checkm-results (legacy) OR CheckM QA options, not both.")
@@ -66,8 +63,6 @@ def _validate_checkm_reuse_args(
             raise typer.BadParameter("Use either --checkm-qa OR --checkm-qa-bacteria/--checkm-qa-archaea, not both.")
 
     if (checkm_qa_bacteria is None) ^ (checkm_qa_archaea is None):
-        # Allow one of them (e.g., bacteria-only datasets).
-        # QC will handle any resulting missing IDs explicitly.
         pass
 
 
@@ -93,7 +88,7 @@ def cmd_run(
         resolve_path=True,
         help="Path to an existing GTDB-Tk classify/ directory. If provided, GTDB-Tk is skipped.",
     ),
-    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for GTDB-Tk / CheckM (if run)."),
+    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for GTDB-Tk / CheckM / Barrnap (if run)."),
 
     # taxonomy options
     move_tax_split: bool = typer.Option(
@@ -105,7 +100,6 @@ def cmd_run(
     # qc options
     skip_qc: bool = typer.Option(False, "--skip-qc", help="Stop after taxonomy (do not run QC)."),
 
-    # Standard CheckM QA inputs (preferred)
     checkm_qa: Path | None = typer.Option(
         None,
         "--checkm-qa",
@@ -128,7 +122,7 @@ def cmd_run(
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="Path to standard CheckM QA table for bacteria (checkm qa ... -o 2 -f checkm_qa.tsv).",
+        help="Path to standard CheckM QA table for bacteria.",
     ),
     checkm_qa_archaea: Path | None = typer.Option(
         None,
@@ -138,10 +132,8 @@ def cmd_run(
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="Path to standard CheckM QA table for archaea (checkm qa ... -o 2 -f checkm_qa.tsv).",
+        help="Path to standard CheckM QA table for archaea.",
     ),
-
-    # Legacy support
     checkm_results: Path | None = typer.Option(
         None,
         "--checkm-results",
@@ -150,20 +142,23 @@ def cmd_run(
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help=(
-            "LEGACY: Path to minimal CheckM TSV with columns: "
-            "genome_id, checkm_completeness, checkm_contamination."
-        ),
+        help="LEGACY: minimal CheckM TSV (genome_id, checkm_completeness, checkm_contamination).",
     ),
 
     completeness_min: float = typer.Option(90.0, "--completeness-min"),
     contamination_max: float = typer.Option(10.0, "--contamination-max"),
     place_mode: str = typer.Option("copy", "--place-mode", help="copy|symlink|hardlink"),
     checkm_bin: str = typer.Option("checkm", "--checkm-bin", help="CheckM executable name or path."),
+
+    # barrnap options
+    skip_barrnap: bool = typer.Option(False, "--skip-barrnap", help="Stop after QC (do not run Barrnap)."),
+    barrnap_bin: str = typer.Option("barrnap", "--barrnap-bin", help="Barrnap executable name or path."),
+    barrnap_reject: float = typer.Option(0.8, "--barrnap-reject", min=0.0, max=1.0),
+
     force: bool = typer.Option(False, "--force"),
 ) -> None:
     """
-    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc).
+    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc -> barrnap).
     """
     _validate_checkm_reuse_args(
         checkm_qa=checkm_qa,
@@ -177,12 +172,11 @@ def cmd_run(
     gtdb_dir = out / "03_gtdbtk"
     tax_dir = out / "04_taxonomy"
     qc_dir = out / "05_qc"
+    barrnap_dir = out / "06_barrnap"
 
     _LOGGER.info("Running MAGPIE workflow in: %s", out)
 
     require_gtdbtk = gtdb_classify is None
-
-    # Require CheckM only if QC will run AND no reuse source was provided
     reuse_provided = (
         (checkm_qa is not None)
         or (checkm_qa_bacteria is not None)
@@ -191,7 +185,7 @@ def cmd_run(
     )
     require_checkm = (not skip_qc) and (not reuse_provided)
 
-    _LOGGER.info("Step 1/5: validate -> %s", validate_dir)
+    _LOGGER.info("Step 1/6: validate -> %s", validate_dir)
     validate_step(
         mags=mags,
         out=validate_dir,
@@ -200,7 +194,7 @@ def cmd_run(
         require_checkm=require_checkm,
     )
 
-    _LOGGER.info("Step 2/5: prep -> %s", prep_dir)
+    _LOGGER.info("Step 2/6: prep -> %s", prep_dir)
     prep_step(
         mags=mags,
         out=prep_dir,
@@ -213,7 +207,7 @@ def cmd_run(
 
     prepared_mags_dir = prep_dir / "mags"
 
-    _LOGGER.info("Step 3/5: gtdbtk (or reuse) -> %s", gtdb_dir)
+    _LOGGER.info("Step 3/6: gtdbtk (or reuse) -> %s", gtdb_dir)
     classify_dir = gtdbtk_step(
         mags_dir=prepared_mags_dir,
         out=gtdb_dir,
@@ -222,7 +216,7 @@ def cmd_run(
         force=force,
     )
 
-    _LOGGER.info("Step 4/5: taxonomy -> %s", tax_dir)
+    _LOGGER.info("Step 4/6: taxonomy -> %s", tax_dir)
     taxonomy_step(
         prep_dir=prep_dir,
         classify_dir=classify_dir,
@@ -235,7 +229,7 @@ def cmd_run(
         _LOGGER.warning("Skipping QC (--skip-qc). Pipeline stops after taxonomy.")
         return
 
-    _LOGGER.info("Step 5/5: qc -> %s", qc_dir)
+    _LOGGER.info("Step 5/6: qc -> %s", qc_dir)
     qc_step(
         tax_dir=tax_dir,
         out=qc_dir,
@@ -249,6 +243,20 @@ def cmd_run(
         contamination_max=contamination_max,
         place_mode=place_mode,
         checkm_bin=checkm_bin,
+    )
+
+    if skip_barrnap:
+        _LOGGER.warning("Skipping Barrnap (--skip-barrnap). Pipeline stops after QC.")
+        return
+
+    _LOGGER.info("Step 6/6: barrnap -> %s", barrnap_dir)
+    barrnap_step(
+        qc_dir=qc_dir,
+        out=barrnap_dir,
+        cpus=cpus,
+        force=force,
+        barrnap_bin=barrnap_bin,
+        reject=barrnap_reject,
     )
 
     _LOGGER.info("MAGPIE run complete.")
@@ -276,47 +284,10 @@ def cmd_qc(
     ),
     cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for CheckM (if run)."),
 
-    checkm_qa: Path | None = typer.Option(
-        None,
-        "--checkm-qa",
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        readable=True,
-        resolve_path=True,
-        help="Path to a single merged standard CheckM QA table (checkm qa ... -o 2 -f checkm_qa.tsv).",
-    ),
-    checkm_qa_bacteria: Path | None = typer.Option(
-        None,
-        "--checkm-qa-bacteria",
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        readable=True,
-        resolve_path=True,
-        help="Path to standard CheckM QA table for bacteria.",
-    ),
-    checkm_qa_archaea: Path | None = typer.Option(
-        None,
-        "--checkm-qa-archaea",
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        readable=True,
-        resolve_path=True,
-        help="Path to standard CheckM QA table for archaea.",
-    ),
-
-    checkm_results: Path | None = typer.Option(
-        None,
-        "--checkm-results",
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        readable=True,
-        resolve_path=True,
-        help="LEGACY: minimal CheckM TSV (genome_id, checkm_completeness, checkm_contamination).",
-    ),
+    checkm_qa: Path | None = typer.Option(None, "--checkm-qa", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
+    checkm_qa_bacteria: Path | None = typer.Option(None, "--checkm-qa-bacteria", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
+    checkm_qa_archaea: Path | None = typer.Option(None, "--checkm-qa-archaea", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
+    checkm_results: Path | None = typer.Option(None, "--checkm-results", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
 
     completeness_min: float = typer.Option(90.0, "--completeness-min"),
     contamination_max: float = typer.Option(10.0, "--contamination-max"),
@@ -324,7 +295,7 @@ def cmd_qc(
     checkm_bin: str = typer.Option("checkm", "--checkm-bin"),
     force: bool = typer.Option(False, "--force"),
 ) -> None:
-    """Run QC on MAGPIE taxonomy outputs (optionally reusing CheckM results)."""
+    """Run QC on MAGPIE taxonomy outputs."""
     _validate_checkm_reuse_args(
         checkm_qa=checkm_qa,
         checkm_qa_bacteria=checkm_qa_bacteria,
@@ -345,6 +316,42 @@ def cmd_qc(
         contamination_max=contamination_max,
         place_mode=place_mode,
         checkm_bin=checkm_bin,
+    )
+
+
+@app.command("barrnap")
+def cmd_barrnap(
+    qc_dir: Path = typer.Option(
+        ...,
+        "--qc-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE QC output directory (e.g. out/05_qc).",
+    ),
+    out: Path = typer.Option(
+        ...,
+        "--out",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        help="Output directory for Barrnap artefacts (e.g. out/06_barrnap).",
+    ),
+    cpus: int = typer.Option(8, "--cpus", min=1, help="Threads for Barrnap."),
+    barrnap_bin: str = typer.Option("barrnap", "--barrnap-bin"),
+    barrnap_reject: float = typer.Option(0.8, "--barrnap-reject", min=0.0, max=1.0),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Predict 16S genes from QC-filtered MAG bins using Barrnap."""
+    barrnap_step(
+        qc_dir=qc_dir,
+        out=out,
+        cpus=cpus,
+        force=force,
+        barrnap_bin=barrnap_bin,
+        reject=barrnap_reject,
     )
 
 
