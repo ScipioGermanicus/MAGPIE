@@ -40,144 +40,139 @@ def _read_fasta_lengths(path: Path) -> List[int]:
     return lengths
 
 
-def _run_command(cmd: list[str], stdout_path: Path | None = None) -> None:
+def _run_command(cmd: list[str]) -> None:
     _LOGGER.debug("Running command: %s", " ".join(cmd))
-
-    if stdout_path is None:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    else:
-        with stdout_path.open("w", encoding="utf-8") as fout:
-            proc = subprocess.run(
-                cmd,
-                stdout=fout,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
     if proc.returncode != 0:
         raise RuntimeError(
             f"Command failed:\n"
             f"  {' '.join(cmd)}\n"
+            f"stdout:\n{proc.stdout}\n"
             f"stderr:\n{proc.stderr}"
         )
+
+
+def _run_ssu_align(
+    *,
+    input_fasta: Path,
+    output_dir: Path,
+    ssu_align_bin: str,
+    force: bool,
+) -> None:
+    cmd = [ssu_align_bin]
+    if force:
+        cmd.append("-f")
+    cmd.extend(["--rfonly", str(input_fasta), str(output_dir)])
+    _run_command(cmd)
+
+
+def _run_esl_reformat(
+    *,
+    stk_path: Path,
+    out_fasta: Path,
+    esl_reformat_bin: str,
+) -> None:
+    cmd = [
+        esl_reformat_bin,
+        "-o",
+        str(out_fasta),
+        "afa",
+        str(stk_path),
+    ]
+    _run_command(cmd)
 
 
 def _align_one_domain(
     *,
     domain: str,
-    centroid_fasta: Path,
-    model_path: Path,
-    out_dir: Path,
-    cmalign_bin: str,
+    input_fasta: Path,
+    out: Path,
+    ssu_align_bin: str,
     esl_reformat_bin: str,
-    cpus: int,
-    mxsize: int,
+    force: bool,
 ) -> Dict[str, object]:
-    """
-    Returns summary stats for one domain.
-    """
-    prefix = f"{domain}_16S_centroids"
-    stk_out = out_dir / f"{prefix}.stk"
-    afa_out = out_dir / f"{prefix}_ssu_align.fna"
+    out_prefix_dir = out / f"{domain}_16S_centroids_ssu_align"
+    out_fasta = out / f"{domain}_16S_centroids_ssu_align.fna"
+    stk_path = out_prefix_dir / f"{domain}_16S_centroids_ssu_align.{domain}.stk"
 
-    _LOGGER.info("Aligning %s centroids with model: %s", domain, model_path)
+    _LOGGER.info("Aligning %s 16S centroids with ssu-align", domain)
 
-    _run_command(
-        [
-            cmalign_bin,
-            "--dna",
-            "--matchonly",
-            "--mxsize",
-            str(mxsize),
-            "--cpu",
-            str(cpus),
-            str(model_path),
-            str(centroid_fasta),
-        ],
-        stdout_path=stk_out,
+    _run_ssu_align(
+        input_fasta=input_fasta,
+        output_dir=out_prefix_dir,
+        ssu_align_bin=ssu_align_bin,
+        force=force,
     )
 
-    _run_command(
-        [
-            esl_reformat_bin,
-            "-o",
-            str(afa_out),
-            "afa",
-            str(stk_out),
-        ]
+    if not stk_path.exists():
+        raise FileNotFoundError(
+            f"Expected Stockholm alignment not found for {domain}: {stk_path}"
+        )
+
+    _run_esl_reformat(
+        stk_path=stk_path,
+        out_fasta=out_fasta,
+        esl_reformat_bin=esl_reformat_bin,
     )
 
-    lengths = _read_fasta_lengths(afa_out)
+    lengths = _read_fasta_lengths(out_fasta)
     n = len(lengths)
-
-    stats = {
-        "domain": domain,
-        "input_fasta": str(centroid_fasta),
-        "model": str(model_path),
-        "stockholm_out": str(stk_out),
-        "aligned_fasta_out": str(afa_out),
-        "n_sequences": n,
-        "min_len": min(lengths) if lengths else 0,
-        "max_len": max(lengths) if lengths else 0,
-        "mean_len": (sum(lengths) / n) if n else 0.0,
-        "median_len": 0.0,
-    }
 
     if n:
         sorted_lengths = sorted(lengths)
         mid = n // 2
         if n % 2 == 1:
-            stats["median_len"] = float(sorted_lengths[mid])
+            median_len = float(sorted_lengths[mid])
         else:
-            stats["median_len"] = (sorted_lengths[mid - 1] + sorted_lengths[mid]) / 2
+            median_len = (sorted_lengths[mid - 1] + sorted_lengths[mid]) / 2.0
+    else:
+        median_len = 0.0
 
-    return stats
+    return {
+        "domain": domain,
+        "input_fasta": str(input_fasta),
+        "ssu_align_dir": str(out_prefix_dir),
+        "stockholm_out": str(stk_path),
+        "aligned_fasta_out": str(out_fasta),
+        "n_sequences": n,
+        "min_len": min(lengths) if lengths else 0,
+        "max_len": max(lengths) if lengths else 0,
+        "mean_len": (sum(lengths) / n) if n else 0.0,
+        "median_len": median_len,
+    }
 
 
 def align_step(
     *,
     rrna_dir: Path,
     out: Path,
-    cpus: int,
     force: bool,
-    cmalign_bin: str,
+    ssu_align_bin: str,
     esl_reformat_bin: str,
-    ssu_models_dir: Path,
-    mxsize_archaea: int = 4096,
-    mxsize_bacteria: int = 8192,
 ) -> None:
     """
-    Align 16S centroid sequences from rrna outputs using cmalign and convert to aligned FASTA.
+    Align 16S centroid sequences from rrna outputs using ssu-align and convert to aligned FASTA.
 
     Expected inputs:
       rrna_dir/archaea/archaea_16S_centroids.fasta
       rrna_dir/bacteria/bacteria_16S_centroids.fasta
-
-    Required models:
-      ssu_models_dir/archaea.cm
-      ssu_models_dir/bacteria.cm
     """
     arch_centroids = rrna_dir / "archaea" / "archaea_16S_centroids.fasta"
     bact_centroids = rrna_dir / "bacteria" / "bacteria_16S_centroids.fasta"
 
-    arch_model = ssu_models_dir / "archaea.cm"
-    bact_model = ssu_models_dir / "bacteria.cm"
-
-    missing = [str(p) for p in [arch_centroids, bact_centroids, arch_model, bact_model] if not p.exists()]
+    missing = [str(p) for p in [arch_centroids, bact_centroids] if not p.exists()]
     if missing:
         raise FileNotFoundError(
-            "Missing required align inputs/models:\n" + "\n".join(f"  - {x}" for x in missing)
+            "Missing required align inputs:\n" + "\n".join(f"  - {x}" for x in missing)
         )
 
     key_outputs = [
-        out / "archaea_16S_centroids.stk",
         out / "archaea_16S_centroids_ssu_align.fna",
-        out / "bacteria_16S_centroids.stk",
         out / "bacteria_16S_centroids_ssu_align.fna",
         out / "summary.tsv",
         out / "report.json",
@@ -187,16 +182,12 @@ def align_step(
 
     _ensure_dir(out)
 
-    rows: List[List[str]] = []
     report = {
         "inputs": {
             "rrna_dir": str(rrna_dir),
-            "ssu_models_dir": str(ssu_models_dir),
-            "cmalign_bin": cmalign_bin,
+            "ssu_align_bin": ssu_align_bin,
             "esl_reformat_bin": esl_reformat_bin,
-            "cpus": cpus,
-            "mxsize_archaea": mxsize_archaea,
-            "mxsize_bacteria": mxsize_bacteria,
+            "force": force,
         },
         "domains": {},
         "outputs": {
@@ -207,25 +198,23 @@ def align_step(
 
     archaea_stats = _align_one_domain(
         domain="archaea",
-        centroid_fasta=arch_centroids,
-        model_path=arch_model,
-        out_dir=out,
-        cmalign_bin=cmalign_bin,
+        input_fasta=arch_centroids,
+        out=out,
+        ssu_align_bin=ssu_align_bin,
         esl_reformat_bin=esl_reformat_bin,
-        cpus=cpus,
-        mxsize=mxsize_archaea,
-    )
-    bacteria_stats = _align_one_domain(
-        domain="bacteria",
-        centroid_fasta=bact_centroids,
-        model_path=bact_model,
-        out_dir=out,
-        cmalign_bin=cmalign_bin,
-        esl_reformat_bin=esl_reformat_bin,
-        cpus=cpus,
-        mxsize=mxsize_bacteria,
+        force=force,
     )
 
+    bacteria_stats = _align_one_domain(
+        domain="bacteria",
+        input_fasta=bact_centroids,
+        out=out,
+        ssu_align_bin=ssu_align_bin,
+        esl_reformat_bin=esl_reformat_bin,
+        force=force,
+    )
+
+    rows = []
     for stats in (archaea_stats, bacteria_stats):
         report["domains"][stats["domain"]] = stats
         rows.append([
@@ -236,7 +225,7 @@ def align_step(
             f"{float(stats['mean_len']):.3f}",
             f"{float(stats['median_len']):.3f}",
             str(stats["input_fasta"]),
-            str(stats["model"]),
+            str(stats["ssu_align_dir"]),
             str(stats["stockholm_out"]),
             str(stats["aligned_fasta_out"]),
         ])
@@ -251,7 +240,7 @@ def align_step(
             "mean_len",
             "median_len",
             "input_fasta",
-            "model",
+            "ssu_align_dir",
             "stockholm_out",
             "aligned_fasta_out",
         ])

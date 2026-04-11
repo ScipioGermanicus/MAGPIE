@@ -165,20 +165,8 @@ def cmd_run(
 
     # align options
     skip_align: bool = typer.Option(False, "--skip-align", help="Stop after rrna (do not run alignment)."),
-    cmalign_bin: str = typer.Option("cmalign", "--cmalign-bin", help="cmalign executable name or path."),
+    ssu_align_bin: str = typer.Option("ssu-align", "--ssu-align-bin", help="SSU-ALIGN executable name or path."),
     esl_reformat_bin: str = typer.Option("esl-reformat", "--esl-reformat-bin", help="esl-reformat executable name or path."),
-    ssu_models_dir: Path = typer.Option(
-        ...,
-        "--ssu-models-dir",
-        exists=True,
-        file_okay=False,
-        dir_okay=True,
-        readable=True,
-        resolve_path=True,
-        help="Directory containing archaea.cm and bacteria.cm covariance models.",
-    ),
-    cmalign_mxsize_archaea: int = typer.Option(4096, "--cmalign-mxsize-archaea", min=1),
-    cmalign_mxsize_bacteria: int = typer.Option(8192, "--cmalign-mxsize-bacteria", min=1),
 
     force: bool = typer.Option(False, "--force"),
 ) -> None:
@@ -309,13 +297,9 @@ def cmd_run(
     align_step(
         rrna_dir=rrna_dir,
         out=align_dir,
-        cpus=cpus,
         force=force,
-        cmalign_bin=cmalign_bin,
+        ssu_align_bin=ssu_align_bin,
         esl_reformat_bin=esl_reformat_bin,
-        ssu_models_dir=ssu_models_dir,
-        mxsize_archaea=cmalign_mxsize_archaea,
-        mxsize_bacteria=cmalign_mxsize_bacteria,
     )
 
     _LOGGER.info("MAGPIE run complete.")
@@ -470,34 +454,17 @@ def cmd_align(
         resolve_path=True,
         help="Output directory for aligned 16S centroids (e.g. out/08_align).",
     ),
-    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for cmalign."),
-    cmalign_bin: str = typer.Option("cmalign", "--cmalign-bin", help="cmalign executable name or path."),
+    ssu_align_bin: str = typer.Option("ssu-align", "--ssu-align-bin", help="SSU-ALIGN executable name or path."),
     esl_reformat_bin: str = typer.Option("esl-reformat", "--esl-reformat-bin", help="esl-reformat executable name or path."),
-    ssu_models_dir: Path = typer.Option(
-        ...,
-        "--ssu-models-dir",
-        exists=True,
-        file_okay=False,
-        dir_okay=True,
-        readable=True,
-        resolve_path=True,
-        help="Directory containing archaea.cm and bacteria.cm covariance models.",
-    ),
-    mxsize_archaea: int = typer.Option(4096, "--mxsize-archaea", min=1),
-    mxsize_bacteria: int = typer.Option(8192, "--mxsize-bacteria", min=1),
     force: bool = typer.Option(False, "--force"),
 ) -> None:
-    """Align domain-specific 16S centroid FASTAs using cmalign and convert to aligned FASTA."""
+    """Align domain-specific 16S centroid FASTAs using ssu-align and convert to aligned FASTA."""
     align_step(
         rrna_dir=rrna_dir,
         out=out,
-        cpus=cpus,
         force=force,
-        cmalign_bin=cmalign_bin,
+        ssu_align_bin=ssu_align_bin,
         esl_reformat_bin=esl_reformat_bin,
-        ssu_models_dir=ssu_models_dir,
-        mxsize_archaea=mxsize_archaea,
-        mxsize_bacteria=mxsize_bacteria,
     )
 
 
