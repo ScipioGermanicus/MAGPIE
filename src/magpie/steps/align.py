@@ -40,6 +40,16 @@ def _read_fasta_lengths(path: Path) -> List[int]:
     return lengths
 
 
+def _has_fasta_records(path: Path) -> bool:
+    if not path.exists():
+        return False
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            if raw.startswith(">"):
+                return True
+    return False
+
+
 def _run_command(cmd: list[str]) -> None:
     _LOGGER.debug("Running command: %s", " ".join(cmd))
     proc = subprocess.run(
@@ -100,6 +110,22 @@ def _align_one_domain(
     out_fasta = out / f"{domain}_16S_centroids_ssu_align.fna"
     stk_path = out_prefix_dir / f"{domain}_16S_centroids_ssu_align.{domain}.stk"
 
+    if not _has_fasta_records(input_fasta):
+        _LOGGER.warning("Skipping %s alignment: no sequences found in %s", domain, input_fasta)
+        return {
+            "domain": domain,
+            "input_fasta": str(input_fasta),
+            "ssu_align_dir": str(out_prefix_dir),
+            "stockholm_out": str(stk_path),
+            "aligned_fasta_out": str(out_fasta),
+            "status": "skipped_empty_input",
+            "n_sequences": 0,
+            "min_len": 0,
+            "max_len": 0,
+            "mean_len": 0.0,
+            "median_len": 0.0,
+        }
+
     _LOGGER.info("Aligning %s 16S centroids with ssu-align", domain)
 
     _run_ssu_align(
@@ -139,6 +165,7 @@ def _align_one_domain(
         "ssu_align_dir": str(out_prefix_dir),
         "stockholm_out": str(stk_path),
         "aligned_fasta_out": str(out_fasta),
+        "status": "aligned",
         "n_sequences": n,
         "min_len": min(lengths) if lengths else 0,
         "max_len": max(lengths) if lengths else 0,
@@ -219,6 +246,7 @@ def align_step(
         report["domains"][stats["domain"]] = stats
         rows.append([
             str(stats["domain"]),
+            str(stats["status"]),
             str(stats["n_sequences"]),
             str(stats["min_len"]),
             str(stats["max_len"]),
@@ -234,6 +262,7 @@ def align_step(
         w = csv.writer(fh, delimiter="\t")
         w.writerow([
             "domain",
+            "status",
             "n_sequences",
             "min_len",
             "max_len",
@@ -249,7 +278,9 @@ def align_step(
     (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     _LOGGER.info(
-        "Alignment complete. Archaea n=%d, Bacteria n=%d",
+        "Alignment complete. Archaea status=%s n=%d; Bacteria status=%s n=%d",
+        str(archaea_stats["status"]),
         int(archaea_stats["n_sequences"]),
+        str(bacteria_stats["status"]),
         int(bacteria_stats["n_sequences"]),
     )
