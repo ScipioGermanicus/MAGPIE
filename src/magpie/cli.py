@@ -13,6 +13,7 @@ from .steps.qc import qc_step
 from .steps.barrnap import barrnap_step
 from .steps.rrna import rrna_step
 from .steps.align import align_step
+from .steps.choose_best import choose_best_step
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -180,10 +181,13 @@ def cmd_run(
     cmalign_mxsize_archaea: int = typer.Option(4096, "--cmalign-mxsize-archaea", min=1),
     cmalign_mxsize_bacteria: int = typer.Option(8192, "--cmalign-mxsize-bacteria", min=1),
 
+    # choose-best options
+    skip_choose_best: bool = typer.Option(False, "--skip-choose-best", help="Stop after align (do not choose best genome per 16S cluster)."),
+
     force: bool = typer.Option(False, "--force"),
 ) -> None:
     """
-    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc -> barrnap -> rrna -> align).
+    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc -> barrnap -> rrna -> align -> choose-best).
     """
     _validate_checkm_reuse_args(
         checkm_qa=checkm_qa,
@@ -200,6 +204,7 @@ def cmd_run(
     barrnap_dir = out / "06_barrnap"
     rrna_dir = out / "07_rrna"
     align_dir = out / "08_align"
+    choose_best_dir = out / "09_choose_best"
 
     _LOGGER.info("Running MAGPIE workflow in: %s", out)
 
@@ -212,7 +217,7 @@ def cmd_run(
     )
     require_checkm = (not skip_qc) and (not reuse_provided)
 
-    _LOGGER.info("Step 1/8: validate -> %s", validate_dir)
+    _LOGGER.info("Step 1/9: validate -> %s", validate_dir)
     validate_step(
         mags=mags,
         out=validate_dir,
@@ -221,7 +226,7 @@ def cmd_run(
         require_checkm=require_checkm,
     )
 
-    _LOGGER.info("Step 2/8: prep -> %s", prep_dir)
+    _LOGGER.info("Step 2/9: prep -> %s", prep_dir)
     prep_step(
         mags=mags,
         out=prep_dir,
@@ -234,7 +239,7 @@ def cmd_run(
 
     prepared_mags_dir = prep_dir / "mags"
 
-    _LOGGER.info("Step 3/8: gtdbtk (or reuse) -> %s", gtdb_dir)
+    _LOGGER.info("Step 3/9: gtdbtk (or reuse) -> %s", gtdb_dir)
     classify_dir = gtdbtk_step(
         mags_dir=prepared_mags_dir,
         out=gtdb_dir,
@@ -243,7 +248,7 @@ def cmd_run(
         force=force,
     )
 
-    _LOGGER.info("Step 4/8: taxonomy -> %s", tax_dir)
+    _LOGGER.info("Step 4/9: taxonomy -> %s", tax_dir)
     taxonomy_step(
         prep_dir=prep_dir,
         classify_dir=classify_dir,
@@ -256,7 +261,7 @@ def cmd_run(
         _LOGGER.warning("Skipping QC (--skip-qc). Pipeline stops after taxonomy.")
         return
 
-    _LOGGER.info("Step 5/8: qc -> %s", qc_dir)
+    _LOGGER.info("Step 5/9: qc -> %s", qc_dir)
     qc_step(
         tax_dir=tax_dir,
         out=qc_dir,
@@ -276,7 +281,7 @@ def cmd_run(
         _LOGGER.warning("Skipping Barrnap (--skip-barrnap). Pipeline stops after QC.")
         return
 
-    _LOGGER.info("Step 6/8: barrnap -> %s", barrnap_dir)
+    _LOGGER.info("Step 6/9: barrnap -> %s", barrnap_dir)
     barrnap_step(
         qc_dir=qc_dir,
         out=barrnap_dir,
@@ -290,7 +295,7 @@ def cmd_run(
         _LOGGER.warning("Skipping rrna (--skip-rrna). Pipeline stops after Barrnap.")
         return
 
-    _LOGGER.info("Step 7/8: rrna -> %s", rrna_dir)
+    _LOGGER.info("Step 7/9: rrna -> %s", rrna_dir)
     rrna_step(
         barrnap_dir=barrnap_dir,
         out=rrna_dir,
@@ -305,7 +310,7 @@ def cmd_run(
         _LOGGER.warning("Skipping align (--skip-align). Pipeline stops after rrna.")
         return
 
-    _LOGGER.info("Step 8/8: align -> %s", align_dir)
+    _LOGGER.info("Step 8/9: align -> %s", align_dir)
     align_step(
         rrna_dir=rrna_dir,
         out=align_dir,
@@ -316,6 +321,20 @@ def cmd_run(
         ssu_models_dir=ssu_models_dir,
         mxsize_archaea=cmalign_mxsize_archaea,
         mxsize_bacteria=cmalign_mxsize_bacteria,
+    )
+
+    if skip_choose_best:
+        _LOGGER.warning("Skipping choose-best (--skip-choose-best). Pipeline stops after align.")
+        return
+
+    _LOGGER.info("Step 9/9: choose-best -> %s", choose_best_dir)
+    choose_best_step(
+        prep_dir=prep_dir,
+        qc_dir=qc_dir,
+        rrna_dir=rrna_dir,
+        align_dir=align_dir,
+        out=choose_best_dir,
+        force=force,
     )
 
     _LOGGER.info("MAGPIE run complete.")
@@ -498,6 +517,69 @@ def cmd_align(
         ssu_models_dir=ssu_models_dir,
         mxsize_archaea=mxsize_archaea,
         mxsize_bacteria=mxsize_bacteria,
+    )
+
+
+@app.command("choose-best")
+def cmd_choose_best(
+    prep_dir: Path = typer.Option(
+        ...,
+        "--prep-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE prep output directory (e.g. out/02_prep).",
+    ),
+    qc_dir: Path = typer.Option(
+        ...,
+        "--qc-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE QC output directory (e.g. out/05_qc).",
+    ),
+    rrna_dir: Path = typer.Option(
+        ...,
+        "--rrna-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE rrna output directory (e.g. out/07_rrna).",
+    ),
+    align_dir: Path = typer.Option(
+        ...,
+        "--align-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE align output directory (e.g. out/08_align).",
+    ),
+    out: Path = typer.Option(
+        ...,
+        "--out",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        help="Output directory for choose-best artefacts (e.g. out/09_choose_best).",
+    ),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Choose the best genome per 16S cluster for archaea and bacteria."""
+    choose_best_step(
+        prep_dir=prep_dir,
+        qc_dir=qc_dir,
+        rrna_dir=rrna_dir,
+        align_dir=align_dir,
+        out=out,
+        force=force,
     )
 
 
