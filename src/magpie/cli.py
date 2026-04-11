@@ -12,6 +12,7 @@ from .steps.taxonomy import taxonomy_step
 from .steps.qc import qc_step
 from .steps.barrnap import barrnap_step
 from .steps.rrna import rrna_step
+from .steps.align import align_step
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -89,7 +90,7 @@ def cmd_run(
         resolve_path=True,
         help="Path to an existing GTDB-Tk classify/ directory. If provided, GTDB-Tk is skipped.",
     ),
-    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for GTDB-Tk / CheckM / Barrnap / VSEARCH (if run)."),
+    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for GTDB-Tk / CheckM / Barrnap / VSEARCH / alignment tools."),
 
     # taxonomy options
     move_tax_split: bool = typer.Option(
@@ -156,16 +157,33 @@ def cmd_run(
     barrnap_bin: str = typer.Option("barrnap", "--barrnap-bin", help="Barrnap executable name or path."),
     barrnap_reject: float = typer.Option(0.8, "--barrnap-reject", min=0.0, max=1.0),
 
-    # rrna / 16S options
-    skip_rrna: bool = typer.Option(False, "--skip-rrna", help="Stop after Barrnap (do not run 16S copy counting/clustering)."),
+    # rrna options
+    skip_rrna: bool = typer.Option(False, "--skip-rrna", help="Stop after Barrnap (do not run 16S representative selection/clustering)."),
     vsearch_bin: str = typer.Option("vsearch", "--vsearch-bin", help="VSEARCH executable name or path."),
-    multi_cluster_id: float = typer.Option(0.90, "--multi-cluster-id", min=0.0, max=1.0, help="Identity for per-genome clustering of multi-copy 16S hits."),
-    final_cluster_id: float = typer.Option(1.0, "--final-cluster-id", min=0.0, max=1.0, help="Identity for final clustering across genome representatives."),
+    multi_cluster_id: float = typer.Option(0.90, "--multi-cluster-id", min=0.0, max=1.0),
+    final_cluster_id: float = typer.Option(1.0, "--final-cluster-id", min=0.0, max=1.0),
+
+    # align options
+    skip_align: bool = typer.Option(False, "--skip-align", help="Stop after rrna (do not run alignment)."),
+    cmalign_bin: str = typer.Option("cmalign", "--cmalign-bin", help="cmalign executable name or path."),
+    esl_reformat_bin: str = typer.Option("esl-reformat", "--esl-reformat-bin", help="esl-reformat executable name or path."),
+    ssu_models_dir: Path = typer.Option(
+        ...,
+        "--ssu-models-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Directory containing archaea.cm and bacteria.cm covariance models.",
+    ),
+    cmalign_mxsize_archaea: int = typer.Option(4096, "--cmalign-mxsize-archaea", min=1),
+    cmalign_mxsize_bacteria: int = typer.Option(8192, "--cmalign-mxsize-bacteria", min=1),
 
     force: bool = typer.Option(False, "--force"),
 ) -> None:
     """
-    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc -> barrnap -> rrna).
+    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc -> barrnap -> rrna -> align).
     """
     _validate_checkm_reuse_args(
         checkm_qa=checkm_qa,
@@ -181,6 +199,7 @@ def cmd_run(
     qc_dir = out / "05_qc"
     barrnap_dir = out / "06_barrnap"
     rrna_dir = out / "07_rrna"
+    align_dir = out / "08_align"
 
     _LOGGER.info("Running MAGPIE workflow in: %s", out)
 
@@ -193,7 +212,7 @@ def cmd_run(
     )
     require_checkm = (not skip_qc) and (not reuse_provided)
 
-    _LOGGER.info("Step 1/7: validate -> %s", validate_dir)
+    _LOGGER.info("Step 1/8: validate -> %s", validate_dir)
     validate_step(
         mags=mags,
         out=validate_dir,
@@ -202,7 +221,7 @@ def cmd_run(
         require_checkm=require_checkm,
     )
 
-    _LOGGER.info("Step 2/7: prep -> %s", prep_dir)
+    _LOGGER.info("Step 2/8: prep -> %s", prep_dir)
     prep_step(
         mags=mags,
         out=prep_dir,
@@ -215,7 +234,7 @@ def cmd_run(
 
     prepared_mags_dir = prep_dir / "mags"
 
-    _LOGGER.info("Step 3/7: gtdbtk (or reuse) -> %s", gtdb_dir)
+    _LOGGER.info("Step 3/8: gtdbtk (or reuse) -> %s", gtdb_dir)
     classify_dir = gtdbtk_step(
         mags_dir=prepared_mags_dir,
         out=gtdb_dir,
@@ -224,7 +243,7 @@ def cmd_run(
         force=force,
     )
 
-    _LOGGER.info("Step 4/7: taxonomy -> %s", tax_dir)
+    _LOGGER.info("Step 4/8: taxonomy -> %s", tax_dir)
     taxonomy_step(
         prep_dir=prep_dir,
         classify_dir=classify_dir,
@@ -237,7 +256,7 @@ def cmd_run(
         _LOGGER.warning("Skipping QC (--skip-qc). Pipeline stops after taxonomy.")
         return
 
-    _LOGGER.info("Step 5/7: qc -> %s", qc_dir)
+    _LOGGER.info("Step 5/8: qc -> %s", qc_dir)
     qc_step(
         tax_dir=tax_dir,
         out=qc_dir,
@@ -257,7 +276,7 @@ def cmd_run(
         _LOGGER.warning("Skipping Barrnap (--skip-barrnap). Pipeline stops after QC.")
         return
 
-    _LOGGER.info("Step 6/7: barrnap -> %s", barrnap_dir)
+    _LOGGER.info("Step 6/8: barrnap -> %s", barrnap_dir)
     barrnap_step(
         qc_dir=qc_dir,
         out=barrnap_dir,
@@ -271,7 +290,7 @@ def cmd_run(
         _LOGGER.warning("Skipping rrna (--skip-rrna). Pipeline stops after Barrnap.")
         return
 
-    _LOGGER.info("Step 7/7: rrna -> %s", rrna_dir)
+    _LOGGER.info("Step 7/8: rrna -> %s", rrna_dir)
     rrna_step(
         barrnap_dir=barrnap_dir,
         out=rrna_dir,
@@ -280,6 +299,23 @@ def cmd_run(
         vsearch_bin=vsearch_bin,
         multi_cluster_id=multi_cluster_id,
         final_cluster_id=final_cluster_id,
+    )
+
+    if skip_align:
+        _LOGGER.warning("Skipping align (--skip-align). Pipeline stops after rrna.")
+        return
+
+    _LOGGER.info("Step 8/8: align -> %s", align_dir)
+    align_step(
+        rrna_dir=rrna_dir,
+        out=align_dir,
+        cpus=cpus,
+        force=force,
+        cmalign_bin=cmalign_bin,
+        esl_reformat_bin=esl_reformat_bin,
+        ssu_models_dir=ssu_models_dir,
+        mxsize_archaea=cmalign_mxsize_archaea,
+        mxsize_bacteria=cmalign_mxsize_bacteria,
     )
 
     _LOGGER.info("MAGPIE run complete.")
@@ -306,12 +342,10 @@ def cmd_qc(
         help="Output directory for QC artefacts (e.g. out/05_qc).",
     ),
     cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for CheckM (if run)."),
-
     checkm_qa: Path | None = typer.Option(None, "--checkm-qa", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
     checkm_qa_bacteria: Path | None = typer.Option(None, "--checkm-qa-bacteria", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
     checkm_qa_archaea: Path | None = typer.Option(None, "--checkm-qa-archaea", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
     checkm_results: Path | None = typer.Option(None, "--checkm-results", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
-
     completeness_min: float = typer.Option(90.0, "--completeness-min"),
     contamination_max: float = typer.Option(10.0, "--contamination-max"),
     place_mode: str = typer.Option("copy", "--place-mode", help="copy|symlink|hardlink"),
@@ -399,9 +433,9 @@ def cmd_rrna(
         help="Output directory for 16S copy counting / clustering artefacts (e.g. out/07_rrna).",
     ),
     cpus: int = typer.Option(8, "--cpus", min=1, help="Threads for VSEARCH."),
-    vsearch_bin: str = typer.Option("vsearch", "--vsearch-bin", help="VSEARCH executable name or path."),
-    multi_cluster_id: float = typer.Option(0.90, "--multi-cluster-id", min=0.0, max=1.0, help="Identity for per-genome clustering of multi-copy 16S hits."),
-    final_cluster_id: float = typer.Option(1.0, "--final-cluster-id", min=0.0, max=1.0, help="Identity for final clustering across genome representatives."),
+    vsearch_bin: str = typer.Option("vsearch", "--vsearch-bin"),
+    multi_cluster_id: float = typer.Option(0.90, "--multi-cluster-id", min=0.0, max=1.0),
+    final_cluster_id: float = typer.Option(1.0, "--final-cluster-id", min=0.0, max=1.0),
     force: bool = typer.Option(False, "--force"),
 ) -> None:
     """Count, cluster, and select representative 16S genes from Barrnap outputs."""
@@ -413,6 +447,57 @@ def cmd_rrna(
         vsearch_bin=vsearch_bin,
         multi_cluster_id=multi_cluster_id,
         final_cluster_id=final_cluster_id,
+    )
+
+
+@app.command("align")
+def cmd_align(
+    rrna_dir: Path = typer.Option(
+        ...,
+        "--rrna-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE rrna output directory (e.g. out/07_rrna).",
+    ),
+    out: Path = typer.Option(
+        ...,
+        "--out",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        help="Output directory for aligned 16S centroids (e.g. out/08_align).",
+    ),
+    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for cmalign."),
+    cmalign_bin: str = typer.Option("cmalign", "--cmalign-bin", help="cmalign executable name or path."),
+    esl_reformat_bin: str = typer.Option("esl-reformat", "--esl-reformat-bin", help="esl-reformat executable name or path."),
+    ssu_models_dir: Path = typer.Option(
+        ...,
+        "--ssu-models-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Directory containing archaea.cm and bacteria.cm covariance models.",
+    ),
+    mxsize_archaea: int = typer.Option(4096, "--mxsize-archaea", min=1),
+    mxsize_bacteria: int = typer.Option(8192, "--mxsize-bacteria", min=1),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Align domain-specific 16S centroid FASTAs using cmalign and convert to aligned FASTA."""
+    align_step(
+        rrna_dir=rrna_dir,
+        out=out,
+        cpus=cpus,
+        force=force,
+        cmalign_bin=cmalign_bin,
+        esl_reformat_bin=esl_reformat_bin,
+        ssu_models_dir=ssu_models_dir,
+        mxsize_archaea=mxsize_archaea,
+        mxsize_bacteria=mxsize_bacteria,
     )
 
 
