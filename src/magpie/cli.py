@@ -16,6 +16,9 @@ from .steps.align import align_step
 from .steps.choose_best import choose_best_step
 from .steps.raxml_check import raxml_check_step
 from .steps.iqtree import iqtree_step
+from .steps.raxml_evaluate import raxml_evaluate_step
+from .steps.hmm_prep import hmm_prep_step
+from .steps.hmm_build import hmm_build_step
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -93,7 +96,7 @@ def cmd_run(
         resolve_path=True,
         help="Path to an existing GTDB-Tk classify/ directory. If provided, GTDB-Tk is skipped.",
     ),
-    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for GTDB-Tk / CheckM / Barrnap / VSEARCH / alignment / tree tools."),
+    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for GTDB-Tk / CheckM / Barrnap / VSEARCH / alignment / tree / HMM tools."),
 
     # taxonomy options
     move_tax_split: bool = typer.Option(
@@ -196,10 +199,20 @@ def cmd_run(
     iqtree_bootstrap: int = typer.Option(1000, "--iqtree-bootstrap", min=0, help="Ultrafast bootstrap replicates for IQ-TREE."),
     iqtree_seed: int = typer.Option(12345, "--iqtree-seed", help="Random seed for IQ-TREE."),
 
+    # raxml-evaluate options
+    skip_raxml_evaluate: bool = typer.Option(False, "--skip-raxml-evaluate", help="Stop after IQ-TREE (do not run RAxML-NG --evaluate)."),
+
+    # hmm-prep options
+    skip_hmm_prep: bool = typer.Option(False, "--skip-hmm-prep", help="Stop after RAxML-evaluate (do not convert reduced PHYLIP to FASTA/DNA FASTA/Stockholm)."),
+
+    # hmm-build options
+    skip_hmm_build: bool = typer.Option(False, "--skip-hmm-build", help="Stop after HMM-prep (do not run hmmbuild on Stockholm files)."),
+    hmmbuild_bin: str = typer.Option("hmmbuild", "--hmmbuild-bin", help="hmmbuild executable name or path."),
+
     force: bool = typer.Option(False, "--force"),
 ) -> None:
     """
-    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc -> barrnap -> rrna -> align -> choose-best -> raxml-check -> iqtree).
+    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc -> barrnap -> rrna -> align -> choose-best -> raxml-check -> iqtree -> raxml-evaluate -> hmm-prep -> hmm-build).
     """
     _validate_checkm_reuse_args(
         checkm_qa=checkm_qa,
@@ -219,6 +232,9 @@ def cmd_run(
     choose_best_dir = out / "09_choose_best"
     raxml_dir = out / "10_raxml_check"
     iqtree_dir = out / "11_iqtree"
+    raxml_eval_dir = out / "12_raxml_evaluate"
+    hmm_prep_dir = out / "13_hmm_prep"
+    hmm_build_dir = out / "14_hmm_build"
 
     _LOGGER.info("Running MAGPIE workflow in: %s", out)
 
@@ -231,7 +247,7 @@ def cmd_run(
     )
     require_checkm = (not skip_qc) and (not reuse_provided)
 
-    _LOGGER.info("Step 1/11: validate -> %s", validate_dir)
+    _LOGGER.info("Step 1/14: validate -> %s", validate_dir)
     validate_step(
         mags=mags,
         out=validate_dir,
@@ -240,7 +256,7 @@ def cmd_run(
         require_checkm=require_checkm,
     )
 
-    _LOGGER.info("Step 2/11: prep -> %s", prep_dir)
+    _LOGGER.info("Step 2/14: prep -> %s", prep_dir)
     prep_step(
         mags=mags,
         out=prep_dir,
@@ -253,7 +269,7 @@ def cmd_run(
 
     prepared_mags_dir = prep_dir / "mags"
 
-    _LOGGER.info("Step 3/11: gtdbtk (or reuse) -> %s", gtdb_dir)
+    _LOGGER.info("Step 3/14: gtdbtk (or reuse) -> %s", gtdb_dir)
     classify_dir = gtdbtk_step(
         mags_dir=prepared_mags_dir,
         out=gtdb_dir,
@@ -262,7 +278,7 @@ def cmd_run(
         force=force,
     )
 
-    _LOGGER.info("Step 4/11: taxonomy -> %s", tax_dir)
+    _LOGGER.info("Step 4/14: taxonomy -> %s", tax_dir)
     taxonomy_step(
         prep_dir=prep_dir,
         classify_dir=classify_dir,
@@ -275,7 +291,7 @@ def cmd_run(
         _LOGGER.warning("Skipping QC (--skip-qc). Pipeline stops after taxonomy.")
         return
 
-    _LOGGER.info("Step 5/11: qc -> %s", qc_dir)
+    _LOGGER.info("Step 5/14: qc -> %s", qc_dir)
     qc_step(
         tax_dir=tax_dir,
         out=qc_dir,
@@ -295,7 +311,7 @@ def cmd_run(
         _LOGGER.warning("Skipping Barrnap (--skip-barrnap). Pipeline stops after QC.")
         return
 
-    _LOGGER.info("Step 6/11: barrnap -> %s", barrnap_dir)
+    _LOGGER.info("Step 6/14: barrnap -> %s", barrnap_dir)
     barrnap_step(
         qc_dir=qc_dir,
         out=barrnap_dir,
@@ -309,7 +325,7 @@ def cmd_run(
         _LOGGER.warning("Skipping rrna (--skip-rrna). Pipeline stops after Barrnap.")
         return
 
-    _LOGGER.info("Step 7/11: rrna -> %s", rrna_dir)
+    _LOGGER.info("Step 7/14: rrna -> %s", rrna_dir)
     rrna_step(
         barrnap_dir=barrnap_dir,
         out=rrna_dir,
@@ -324,7 +340,7 @@ def cmd_run(
         _LOGGER.warning("Skipping align (--skip-align). Pipeline stops after rrna.")
         return
 
-    _LOGGER.info("Step 8/11: align -> %s", align_dir)
+    _LOGGER.info("Step 8/14: align -> %s", align_dir)
     align_step(
         rrna_dir=rrna_dir,
         out=align_dir,
@@ -341,7 +357,7 @@ def cmd_run(
         _LOGGER.warning("Skipping choose-best (--skip-choose-best). Pipeline stops after align.")
         return
 
-    _LOGGER.info("Step 9/11: choose-best -> %s", choose_best_dir)
+    _LOGGER.info("Step 9/14: choose-best -> %s", choose_best_dir)
     choose_best_step(
         prep_dir=prep_dir,
         qc_dir=qc_dir,
@@ -355,7 +371,7 @@ def cmd_run(
         _LOGGER.warning("Skipping raxml-check (--skip-raxml-check). Pipeline stops after choose-best.")
         return
 
-    _LOGGER.info("Step 10/11: raxml-check -> %s", raxml_dir)
+    _LOGGER.info("Step 10/14: raxml-check -> %s", raxml_dir)
     raxml_check_step(
         choose_best_dir=choose_best_dir,
         out=raxml_dir,
@@ -368,7 +384,7 @@ def cmd_run(
         _LOGGER.warning("Skipping iqtree (--skip-iqtree). Pipeline stops after raxml-check.")
         return
 
-    _LOGGER.info("Step 11/11: iqtree -> %s", iqtree_dir)
+    _LOGGER.info("Step 11/14: iqtree -> %s", iqtree_dir)
     iqtree_step(
         raxml_check_dir=raxml_dir,
         out=iqtree_dir,
@@ -376,6 +392,45 @@ def cmd_run(
         threads=cpus,
         bootstrap=iqtree_bootstrap,
         seed=iqtree_seed,
+        force=force,
+    )
+
+    if skip_raxml_evaluate:
+        _LOGGER.warning("Skipping raxml-evaluate (--skip-raxml-evaluate). Pipeline stops after iqtree.")
+        return
+
+    _LOGGER.info("Step 12/14: raxml-evaluate -> %s", raxml_eval_dir)
+    raxml_evaluate_step(
+        raxml_check_dir=raxml_dir,
+        iqtree_dir=iqtree_dir,
+        out=raxml_eval_dir,
+        raxml_ng_bin=raxml_ng_bin,
+        threads=cpus,
+        force=force,
+    )
+
+    if skip_hmm_prep:
+        _LOGGER.warning("Skipping hmm-prep (--skip-hmm-prep). Pipeline stops after raxml-evaluate.")
+        return
+
+    _LOGGER.info("Step 13/14: hmm-prep -> %s", hmm_prep_dir)
+    hmm_prep_step(
+        raxml_check_dir=raxml_dir,
+        out=hmm_prep_dir,
+        esl_reformat_bin=esl_reformat_bin,
+        force=force,
+    )
+
+    if skip_hmm_build:
+        _LOGGER.warning("Skipping hmm-build (--skip-hmm-build). Pipeline stops after hmm-prep.")
+        return
+
+    _LOGGER.info("Step 14/14: hmm-build -> %s", hmm_build_dir)
+    hmm_build_step(
+        hmm_prep_dir=hmm_prep_dir,
+        out=hmm_build_dir,
+        hmmbuild_bin=hmmbuild_bin,
+        cpus=cpus,
         force=force,
     )
 
@@ -693,6 +748,117 @@ def cmd_iqtree(
         threads=threads,
         bootstrap=bootstrap,
         seed=seed,
+        force=force,
+    )
+
+
+@app.command("raxml-evaluate")
+def cmd_raxml_evaluate(
+    raxml_check_dir: Path = typer.Option(
+        ...,
+        "--raxml-check-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE raxml-check output directory (e.g. out/10_raxml_check).",
+    ),
+    iqtree_dir: Path = typer.Option(
+        ...,
+        "--iqtree-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE IQ-TREE output directory (e.g. out/11_iqtree).",
+    ),
+    out: Path = typer.Option(
+        ...,
+        "--out",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        help="Output directory for RAxML-evaluate artefacts (e.g. out/12_raxml_evaluate).",
+    ),
+    raxml_ng_bin: str = typer.Option("raxml-ng", "--raxml-ng-bin", help="raxml-ng executable name or path."),
+    threads: int = typer.Option(8, "--threads", min=1, help="Threads for raxml-ng."),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Evaluate IQ-TREE starting trees with RAxML-NG using reduced PHYLIP alignments."""
+    raxml_evaluate_step(
+        raxml_check_dir=raxml_check_dir,
+        iqtree_dir=iqtree_dir,
+        out=out,
+        raxml_ng_bin=raxml_ng_bin,
+        threads=threads,
+        force=force,
+    )
+
+
+@app.command("hmm-prep")
+def cmd_hmm_prep(
+    raxml_check_dir: Path = typer.Option(
+        ...,
+        "--raxml-check-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE raxml-check output directory (e.g. out/10_raxml_check).",
+    ),
+    out: Path = typer.Option(
+        ...,
+        "--out",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        help="Output directory for HMM-prep artefacts (e.g. out/13_hmm_prep).",
+    ),
+    esl_reformat_bin: str = typer.Option("esl-reformat", "--esl-reformat-bin", help="esl-reformat executable name or path."),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Convert reduced PHYLIP alignments to FASTA, DNA FASTA, and Stockholm for HMM preparation."""
+    hmm_prep_step(
+        raxml_check_dir=raxml_check_dir,
+        out=out,
+        esl_reformat_bin=esl_reformat_bin,
+        force=force,
+    )
+
+
+@app.command("hmm-build")
+def cmd_hmm_build(
+    hmm_prep_dir: Path = typer.Option(
+        ...,
+        "--hmm-prep-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE HMM-prep output directory (e.g. out/13_hmm_prep).",
+    ),
+    out: Path = typer.Option(
+        ...,
+        "--out",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        help="Output directory for HMM-build artefacts (e.g. out/14_hmm_build).",
+    ),
+    hmmbuild_bin: str = typer.Option("hmmbuild", "--hmmbuild-bin", help="hmmbuild executable name or path."),
+    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for hmmbuild."),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Build archaeal and bacterial 16S HMMs from Stockholm alignments."""
+    hmm_build_step(
+        hmm_prep_dir=hmm_prep_dir,
+        out=out,
+        hmmbuild_bin=hmmbuild_bin,
+        cpus=cpus,
         force=force,
     )
 
