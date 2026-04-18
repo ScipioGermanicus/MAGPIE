@@ -14,6 +14,8 @@ from .steps.barrnap import barrnap_step
 from .steps.rrna import rrna_step
 from .steps.align import align_step
 from .steps.choose_best import choose_best_step
+from .steps.raxml_check import raxml_check_step
+from .steps.iqtree import iqtree_step
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -91,7 +93,7 @@ def cmd_run(
         resolve_path=True,
         help="Path to an existing GTDB-Tk classify/ directory. If provided, GTDB-Tk is skipped.",
     ),
-    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for GTDB-Tk / CheckM / Barrnap / VSEARCH / alignment tools."),
+    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for GTDB-Tk / CheckM / Barrnap / VSEARCH / alignment / tree tools."),
 
     # taxonomy options
     move_tax_split: bool = typer.Option(
@@ -184,10 +186,20 @@ def cmd_run(
     # choose-best options
     skip_choose_best: bool = typer.Option(False, "--skip-choose-best", help="Stop after align (do not choose best genome per 16S cluster)."),
 
+    # raxml-check options
+    skip_raxml_check: bool = typer.Option(False, "--skip-raxml-check", help="Stop after choose-best (do not run raxml-ng --check)."),
+    raxml_ng_bin: str = typer.Option("raxml-ng", "--raxml-ng-bin", help="raxml-ng executable name or path."),
+
+    # iqtree options
+    skip_iqtree: bool = typer.Option(False, "--skip-iqtree", help="Stop after raxml-check (do not build IQ-TREE trees)."),
+    iqtree_bin: str = typer.Option("iqtree", "--iqtree-bin", help="IQ-TREE executable name or path."),
+    iqtree_bootstrap: int = typer.Option(1000, "--iqtree-bootstrap", min=0, help="Ultrafast bootstrap replicates for IQ-TREE."),
+    iqtree_seed: int = typer.Option(12345, "--iqtree-seed", help="Random seed for IQ-TREE."),
+
     force: bool = typer.Option(False, "--force"),
 ) -> None:
     """
-    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc -> barrnap -> rrna -> align -> choose-best).
+    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc -> barrnap -> rrna -> align -> choose-best -> raxml-check -> iqtree).
     """
     _validate_checkm_reuse_args(
         checkm_qa=checkm_qa,
@@ -205,6 +217,8 @@ def cmd_run(
     rrna_dir = out / "07_rrna"
     align_dir = out / "08_align"
     choose_best_dir = out / "09_choose_best"
+    raxml_dir = out / "10_raxml_check"
+    iqtree_dir = out / "11_iqtree"
 
     _LOGGER.info("Running MAGPIE workflow in: %s", out)
 
@@ -217,7 +231,7 @@ def cmd_run(
     )
     require_checkm = (not skip_qc) and (not reuse_provided)
 
-    _LOGGER.info("Step 1/9: validate -> %s", validate_dir)
+    _LOGGER.info("Step 1/11: validate -> %s", validate_dir)
     validate_step(
         mags=mags,
         out=validate_dir,
@@ -226,7 +240,7 @@ def cmd_run(
         require_checkm=require_checkm,
     )
 
-    _LOGGER.info("Step 2/9: prep -> %s", prep_dir)
+    _LOGGER.info("Step 2/11: prep -> %s", prep_dir)
     prep_step(
         mags=mags,
         out=prep_dir,
@@ -239,7 +253,7 @@ def cmd_run(
 
     prepared_mags_dir = prep_dir / "mags"
 
-    _LOGGER.info("Step 3/9: gtdbtk (or reuse) -> %s", gtdb_dir)
+    _LOGGER.info("Step 3/11: gtdbtk (or reuse) -> %s", gtdb_dir)
     classify_dir = gtdbtk_step(
         mags_dir=prepared_mags_dir,
         out=gtdb_dir,
@@ -248,7 +262,7 @@ def cmd_run(
         force=force,
     )
 
-    _LOGGER.info("Step 4/9: taxonomy -> %s", tax_dir)
+    _LOGGER.info("Step 4/11: taxonomy -> %s", tax_dir)
     taxonomy_step(
         prep_dir=prep_dir,
         classify_dir=classify_dir,
@@ -261,7 +275,7 @@ def cmd_run(
         _LOGGER.warning("Skipping QC (--skip-qc). Pipeline stops after taxonomy.")
         return
 
-    _LOGGER.info("Step 5/9: qc -> %s", qc_dir)
+    _LOGGER.info("Step 5/11: qc -> %s", qc_dir)
     qc_step(
         tax_dir=tax_dir,
         out=qc_dir,
@@ -281,7 +295,7 @@ def cmd_run(
         _LOGGER.warning("Skipping Barrnap (--skip-barrnap). Pipeline stops after QC.")
         return
 
-    _LOGGER.info("Step 6/9: barrnap -> %s", barrnap_dir)
+    _LOGGER.info("Step 6/11: barrnap -> %s", barrnap_dir)
     barrnap_step(
         qc_dir=qc_dir,
         out=barrnap_dir,
@@ -295,7 +309,7 @@ def cmd_run(
         _LOGGER.warning("Skipping rrna (--skip-rrna). Pipeline stops after Barrnap.")
         return
 
-    _LOGGER.info("Step 7/9: rrna -> %s", rrna_dir)
+    _LOGGER.info("Step 7/11: rrna -> %s", rrna_dir)
     rrna_step(
         barrnap_dir=barrnap_dir,
         out=rrna_dir,
@@ -310,7 +324,7 @@ def cmd_run(
         _LOGGER.warning("Skipping align (--skip-align). Pipeline stops after rrna.")
         return
 
-    _LOGGER.info("Step 8/9: align -> %s", align_dir)
+    _LOGGER.info("Step 8/11: align -> %s", align_dir)
     align_step(
         rrna_dir=rrna_dir,
         out=align_dir,
@@ -327,13 +341,41 @@ def cmd_run(
         _LOGGER.warning("Skipping choose-best (--skip-choose-best). Pipeline stops after align.")
         return
 
-    _LOGGER.info("Step 9/9: choose-best -> %s", choose_best_dir)
+    _LOGGER.info("Step 9/11: choose-best -> %s", choose_best_dir)
     choose_best_step(
         prep_dir=prep_dir,
         qc_dir=qc_dir,
         rrna_dir=rrna_dir,
         align_dir=align_dir,
         out=choose_best_dir,
+        force=force,
+    )
+
+    if skip_raxml_check:
+        _LOGGER.warning("Skipping raxml-check (--skip-raxml-check). Pipeline stops after choose-best.")
+        return
+
+    _LOGGER.info("Step 10/11: raxml-check -> %s", raxml_dir)
+    raxml_check_step(
+        choose_best_dir=choose_best_dir,
+        out=raxml_dir,
+        raxml_ng_bin=raxml_ng_bin,
+        threads=cpus,
+        force=force,
+    )
+
+    if skip_iqtree:
+        _LOGGER.warning("Skipping iqtree (--skip-iqtree). Pipeline stops after raxml-check.")
+        return
+
+    _LOGGER.info("Step 11/11: iqtree -> %s", iqtree_dir)
+    iqtree_step(
+        raxml_check_dir=raxml_dir,
+        out=iqtree_dir,
+        iqtree_bin=iqtree_bin,
+        threads=cpus,
+        bootstrap=iqtree_bootstrap,
+        seed=iqtree_seed,
         force=force,
     )
 
@@ -579,6 +621,78 @@ def cmd_choose_best(
         rrna_dir=rrna_dir,
         align_dir=align_dir,
         out=out,
+        force=force,
+    )
+
+
+@app.command("raxml-check")
+def cmd_raxml_check(
+    choose_best_dir: Path = typer.Option(
+        ...,
+        "--choose-best-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE choose-best output directory (e.g. out/09_choose_best).",
+    ),
+    out: Path = typer.Option(
+        ...,
+        "--out",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        help="Output directory for RAxML-check artefacts (e.g. out/10_raxml_check).",
+    ),
+    raxml_ng_bin: str = typer.Option("raxml-ng", "--raxml-ng-bin", help="raxml-ng executable name or path."),
+    threads: int = typer.Option(8, "--threads", min=1, help="Threads for raxml-ng."),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Run raxml-ng --check on best aligned 16S FASTAs and ensure reduced PHYLIP outputs exist."""
+    raxml_check_step(
+        choose_best_dir=choose_best_dir,
+        out=out,
+        raxml_ng_bin=raxml_ng_bin,
+        threads=threads,
+        force=force,
+    )
+
+
+@app.command("iqtree")
+def cmd_iqtree(
+    raxml_check_dir: Path = typer.Option(
+        ...,
+        "--raxml-check-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE raxml-check output directory (e.g. out/10_raxml_check).",
+    ),
+    out: Path = typer.Option(
+        ...,
+        "--out",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        help="Output directory for IQ-TREE artefacts (e.g. out/11_iqtree).",
+    ),
+    iqtree_bin: str = typer.Option("iqtree", "--iqtree-bin", help="IQ-TREE executable name or path."),
+    threads: int = typer.Option(8, "--threads", min=1, help="Threads for IQ-TREE."),
+    bootstrap: int = typer.Option(1000, "--bootstrap", min=0, help="Ultrafast bootstrap replicates for IQ-TREE."),
+    seed: int = typer.Option(12345, "--seed", help="Random seed for IQ-TREE."),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Build archaeal and bacterial 16S trees from reduced PHYLIP alignments using IQ-TREE."""
+    iqtree_step(
+        raxml_check_dir=raxml_check_dir,
+        out=out,
+        iqtree_bin=iqtree_bin,
+        threads=threads,
+        bootstrap=bootstrap,
+        seed=seed,
         force=force,
     )
 
