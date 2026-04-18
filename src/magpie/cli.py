@@ -20,6 +20,7 @@ from .steps.raxml_evaluate import raxml_evaluate_step
 from .steps.hmm_prep import hmm_prep_step
 from .steps.hmm_build import hmm_build_step
 from .steps.package_ref import package_ref_step
+from .steps.eggnog import eggnog_step
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -97,7 +98,7 @@ def cmd_run(
         resolve_path=True,
         help="Path to an existing GTDB-Tk classify/ directory. If provided, GTDB-Tk is skipped.",
     ),
-    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for GTDB-Tk / CheckM / Barrnap / VSEARCH / alignment / tree / HMM tools."),
+    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for GTDB-Tk / CheckM / Barrnap / VSEARCH / alignment / tree / HMM / eggNOG tools."),
 
     # taxonomy options
     move_tax_split: bool = typer.Option(
@@ -213,10 +214,35 @@ def cmd_run(
     # package-ref options
     skip_package_ref: bool = typer.Option(False, "--skip-package-ref", help="Stop after HMM-build (do not package PICRUSt2-style reference folders)."),
 
+    # eggnog options
+    skip_eggnog: bool = typer.Option(False, "--skip-eggnog", help="Stop after package-ref (do not run or reuse eggNOG annotations)."),
+    eggnog_existing_dir: Path | None = typer.Option(
+        None,
+        "--eggnog-existing-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Directory containing existing eggNOG annotation files named <genome_id>.emapper.annotations.",
+    ),
+    eggnog_data_dir: Path | None = typer.Option(
+        None,
+        "--eggnog-data-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="eggNOG-mapper data directory. Required if running annotation anew.",
+    ),
+    prodigal_bin: str = typer.Option("prodigal", "--prodigal-bin", help="Prodigal executable name or path."),
+    emapper_bin: str = typer.Option("emapper.py", "--emapper-bin", help="eggNOG-mapper executable name or path."),
+
     force: bool = typer.Option(False, "--force"),
 ) -> None:
     """
-    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc -> barrnap -> rrna -> align -> choose-best -> raxml-check -> iqtree -> raxml-evaluate -> hmm-prep -> hmm-build -> package-ref).
+    Run MAGPIE workflow (validate -> prep -> gtdbtk (optional) -> taxonomy -> qc -> barrnap -> rrna -> align -> choose-best -> raxml-check -> iqtree -> raxml-evaluate -> hmm-prep -> hmm-build -> package-ref -> eggnog).
     """
     _validate_checkm_reuse_args(
         checkm_qa=checkm_qa,
@@ -240,6 +266,7 @@ def cmd_run(
     hmm_prep_dir = out / "13_hmm_prep"
     hmm_build_dir = out / "14_hmm_build"
     package_ref_dir = out / "15_package_ref"
+    eggnog_dir = out / "16_eggnog"
 
     _LOGGER.info("Running MAGPIE workflow in: %s", out)
 
@@ -252,7 +279,7 @@ def cmd_run(
     )
     require_checkm = (not skip_qc) and (not reuse_provided)
 
-    _LOGGER.info("Step 1/15: validate -> %s", validate_dir)
+    _LOGGER.info("Step 1/16: validate -> %s", validate_dir)
     validate_step(
         mags=mags,
         out=validate_dir,
@@ -261,7 +288,7 @@ def cmd_run(
         require_checkm=require_checkm,
     )
 
-    _LOGGER.info("Step 2/15: prep -> %s", prep_dir)
+    _LOGGER.info("Step 2/16: prep -> %s", prep_dir)
     prep_step(
         mags=mags,
         out=prep_dir,
@@ -274,7 +301,7 @@ def cmd_run(
 
     prepared_mags_dir = prep_dir / "mags"
 
-    _LOGGER.info("Step 3/15: gtdbtk (or reuse) -> %s", gtdb_dir)
+    _LOGGER.info("Step 3/16: gtdbtk (or reuse) -> %s", gtdb_dir)
     classify_dir = gtdbtk_step(
         mags_dir=prepared_mags_dir,
         out=gtdb_dir,
@@ -283,7 +310,7 @@ def cmd_run(
         force=force,
     )
 
-    _LOGGER.info("Step 4/15: taxonomy -> %s", tax_dir)
+    _LOGGER.info("Step 4/16: taxonomy -> %s", tax_dir)
     taxonomy_step(
         prep_dir=prep_dir,
         classify_dir=classify_dir,
@@ -296,7 +323,7 @@ def cmd_run(
         _LOGGER.warning("Skipping QC (--skip-qc). Pipeline stops after taxonomy.")
         return
 
-    _LOGGER.info("Step 5/15: qc -> %s", qc_dir)
+    _LOGGER.info("Step 5/16: qc -> %s", qc_dir)
     qc_step(
         tax_dir=tax_dir,
         out=qc_dir,
@@ -316,7 +343,7 @@ def cmd_run(
         _LOGGER.warning("Skipping Barrnap (--skip-barrnap). Pipeline stops after QC.")
         return
 
-    _LOGGER.info("Step 6/15: barrnap -> %s", barrnap_dir)
+    _LOGGER.info("Step 6/16: barrnap -> %s", barrnap_dir)
     barrnap_step(
         qc_dir=qc_dir,
         out=barrnap_dir,
@@ -330,7 +357,7 @@ def cmd_run(
         _LOGGER.warning("Skipping rrna (--skip-rrna). Pipeline stops after Barrnap.")
         return
 
-    _LOGGER.info("Step 7/15: rrna -> %s", rrna_dir)
+    _LOGGER.info("Step 7/16: rrna -> %s", rrna_dir)
     rrna_step(
         barrnap_dir=barrnap_dir,
         out=rrna_dir,
@@ -345,7 +372,7 @@ def cmd_run(
         _LOGGER.warning("Skipping align (--skip-align). Pipeline stops after rrna.")
         return
 
-    _LOGGER.info("Step 8/15: align -> %s", align_dir)
+    _LOGGER.info("Step 8/16: align -> %s", align_dir)
     align_step(
         rrna_dir=rrna_dir,
         out=align_dir,
@@ -362,7 +389,7 @@ def cmd_run(
         _LOGGER.warning("Skipping choose-best (--skip-choose-best). Pipeline stops after align.")
         return
 
-    _LOGGER.info("Step 9/15: choose-best -> %s", choose_best_dir)
+    _LOGGER.info("Step 9/16: choose-best -> %s", choose_best_dir)
     choose_best_step(
         prep_dir=prep_dir,
         qc_dir=qc_dir,
@@ -376,7 +403,7 @@ def cmd_run(
         _LOGGER.warning("Skipping raxml-check (--skip-raxml-check). Pipeline stops after choose-best.")
         return
 
-    _LOGGER.info("Step 10/15: raxml-check -> %s", raxml_dir)
+    _LOGGER.info("Step 10/16: raxml-check -> %s", raxml_dir)
     raxml_check_step(
         choose_best_dir=choose_best_dir,
         out=raxml_dir,
@@ -389,7 +416,7 @@ def cmd_run(
         _LOGGER.warning("Skipping iqtree (--skip-iqtree). Pipeline stops after raxml-check.")
         return
 
-    _LOGGER.info("Step 11/15: iqtree -> %s", iqtree_dir)
+    _LOGGER.info("Step 11/16: iqtree -> %s", iqtree_dir)
     iqtree_step(
         raxml_check_dir=raxml_dir,
         out=iqtree_dir,
@@ -404,7 +431,7 @@ def cmd_run(
         _LOGGER.warning("Skipping raxml-evaluate (--skip-raxml-evaluate). Pipeline stops after iqtree.")
         return
 
-    _LOGGER.info("Step 12/15: raxml-evaluate -> %s", raxml_eval_dir)
+    _LOGGER.info("Step 12/16: raxml-evaluate -> %s", raxml_eval_dir)
     raxml_evaluate_step(
         raxml_check_dir=raxml_dir,
         iqtree_dir=iqtree_dir,
@@ -418,7 +445,7 @@ def cmd_run(
         _LOGGER.warning("Skipping hmm-prep (--skip-hmm-prep). Pipeline stops after raxml-evaluate.")
         return
 
-    _LOGGER.info("Step 13/15: hmm-prep -> %s", hmm_prep_dir)
+    _LOGGER.info("Step 13/16: hmm-prep -> %s", hmm_prep_dir)
     hmm_prep_step(
         raxml_check_dir=raxml_dir,
         out=hmm_prep_dir,
@@ -430,7 +457,7 @@ def cmd_run(
         _LOGGER.warning("Skipping hmm-build (--skip-hmm-build). Pipeline stops after hmm-prep.")
         return
 
-    _LOGGER.info("Step 14/15: hmm-build -> %s", hmm_build_dir)
+    _LOGGER.info("Step 14/16: hmm-build -> %s", hmm_build_dir)
     hmm_build_step(
         hmm_prep_dir=hmm_prep_dir,
         out=hmm_build_dir,
@@ -443,7 +470,7 @@ def cmd_run(
         _LOGGER.warning("Skipping package-ref (--skip-package-ref). Pipeline stops after hmm-build.")
         return
 
-    _LOGGER.info("Step 15/15: package-ref -> %s", package_ref_dir)
+    _LOGGER.info("Step 15/16: package-ref -> %s", package_ref_dir)
     package_ref_step(
         rrna_dir=rrna_dir,
         iqtree_dir=iqtree_dir,
@@ -452,6 +479,22 @@ def cmd_run(
         hmm_build_dir=hmm_build_dir,
         out=package_ref_dir,
         force=force,
+    )
+
+    if skip_eggnog:
+        _LOGGER.warning("Skipping eggnog (--skip-eggnog). Pipeline stops after package-ref.")
+        return
+
+    _LOGGER.info("Step 16/16: eggnog -> %s", eggnog_dir)
+    eggnog_step(
+        prep_dir=prep_dir,
+        out=eggnog_dir,
+        cpus=cpus,
+        force=force,
+        eggnog_existing_dir=eggnog_existing_dir,
+        eggnog_data_dir=eggnog_data_dir,
+        prodigal_bin=prodigal_bin,
+        emapper_bin=emapper_bin,
     )
 
     _LOGGER.info("MAGPIE run complete.")
@@ -954,6 +997,64 @@ def cmd_package_ref(
         hmm_build_dir=hmm_build_dir,
         out=out,
         force=force,
+    )
+
+
+@app.command("eggnog")
+def cmd_eggnog(
+    prep_dir: Path = typer.Option(
+        ...,
+        "--prep-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE prep output directory (e.g. out/02_prep).",
+    ),
+    out: Path = typer.Option(
+        ...,
+        "--out",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        help="Output directory for eggNOG artefacts (e.g. out/16_eggnog).",
+    ),
+    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for eggNOG-mapper."),
+    eggnog_existing_dir: Path | None = typer.Option(
+        None,
+        "--eggnog-existing-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Directory containing existing eggNOG annotation files named <genome_id>.emapper.annotations.",
+    ),
+    eggnog_data_dir: Path | None = typer.Option(
+        None,
+        "--eggnog-data-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="eggNOG-mapper data directory. Required if running annotation anew.",
+    ),
+    prodigal_bin: str = typer.Option("prodigal", "--prodigal-bin", help="Prodigal executable name or path."),
+    emapper_bin: str = typer.Option("emapper.py", "--emapper-bin", help="eggNOG-mapper executable name or path."),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Reuse existing eggNOG annotations or run Prodigal + eggNOG-mapper on prepared MAGs."""
+    eggnog_step(
+        prep_dir=prep_dir,
+        out=out,
+        cpus=cpus,
+        force=force,
+        eggnog_existing_dir=eggnog_existing_dir,
+        eggnog_data_dir=eggnog_data_dir,
+        prodigal_bin=prodigal_bin,
+        emapper_bin=emapper_bin,
     )
 
 
