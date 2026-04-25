@@ -61,6 +61,7 @@ def _run_raxml_evaluate(
     prefix: Path,
     raxml_ng_bin: str,
     threads: int,
+    force: bool,
 ) -> None:
     cmd = [
         raxml_ng_bin,
@@ -76,6 +77,10 @@ def _run_raxml_evaluate(
         "--threads",
         str(threads),
     ]
+
+    if force:
+        cmd.append("--redo")
+
     _run_command(cmd)
 
 
@@ -87,6 +92,7 @@ def _evaluate_one_domain(
     out_dir: Path,
     raxml_ng_bin: str,
     threads: int,
+    force: bool,
 ) -> Dict[str, object]:
     prefix = out_dir / f"{domain}_raxml"
     best_tree = out_dir / f"{domain}_raxml.raxml.bestTree"
@@ -139,6 +145,7 @@ def _evaluate_one_domain(
         prefix=prefix,
         raxml_ng_bin=raxml_ng_bin,
         threads=threads,
+        force=force,
     )
 
     return {
