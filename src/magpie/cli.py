@@ -21,6 +21,7 @@ from .steps.hmm_prep import hmm_prep_step
 from .steps.hmm_build import hmm_build_step
 from .steps.package_ref import package_ref_step
 from .steps.ko_table import ko_table_step
+from .steps.ec_table import ec_table_step
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -98,54 +99,14 @@ def cmd_run(
     ),
     cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for external tools."),
 
-    move_tax_split: bool = typer.Option(
-        False,
-        "--move-tax-split",
-        help="Move genomes into bacteria/archaea split dirs (default is copy; safer).",
-    ),
+    move_tax_split: bool = typer.Option(False, "--move-tax-split"),
 
     skip_qc: bool = typer.Option(False, "--skip-qc", help="Stop after taxonomy."),
 
-    checkm_qa: Path | None = typer.Option(
-        None,
-        "--checkm-qa",
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        readable=True,
-        resolve_path=True,
-        help="Path to a single merged CheckM QA table.",
-    ),
-    checkm_qa_bacteria: Path | None = typer.Option(
-        None,
-        "--checkm-qa-bacteria",
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        readable=True,
-        resolve_path=True,
-        help="Path to standard CheckM QA table for bacteria.",
-    ),
-    checkm_qa_archaea: Path | None = typer.Option(
-        None,
-        "--checkm-qa-archaea",
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        readable=True,
-        resolve_path=True,
-        help="Path to standard CheckM QA table for archaea.",
-    ),
-    checkm_results: Path | None = typer.Option(
-        None,
-        "--checkm-results",
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        readable=True,
-        resolve_path=True,
-        help="LEGACY: minimal CheckM TSV.",
-    ),
+    checkm_qa: Path | None = typer.Option(None, "--checkm-qa", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
+    checkm_qa_bacteria: Path | None = typer.Option(None, "--checkm-qa-bacteria", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
+    checkm_qa_archaea: Path | None = typer.Option(None, "--checkm-qa-archaea", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
+    checkm_results: Path | None = typer.Option(None, "--checkm-results", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
     completeness_min: float = typer.Option(90.0, "--completeness-min"),
     contamination_max: float = typer.Option(10.0, "--contamination-max"),
     place_mode: str = typer.Option("copy", "--place-mode", help="copy|symlink|hardlink"),
@@ -163,16 +124,7 @@ def cmd_run(
     skip_align: bool = typer.Option(False, "--skip-align", help="Stop after rrna."),
     cmalign_bin: str = typer.Option("cmalign", "--cmalign-bin"),
     esl_reformat_bin: str = typer.Option("esl-reformat", "--esl-reformat-bin"),
-    ssu_models_dir: Path = typer.Option(
-        ...,
-        "--ssu-models-dir",
-        exists=True,
-        file_okay=False,
-        dir_okay=True,
-        readable=True,
-        resolve_path=True,
-        help="Directory containing archaea.cm and bacteria.cm covariance models.",
-    ),
+    ssu_models_dir: Path = typer.Option(..., "--ssu-models-dir", exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True),
     cmalign_mxsize_archaea: int = typer.Option(4096, "--cmalign-mxsize-archaea", min=1),
     cmalign_mxsize_bacteria: int = typer.Option(8192, "--cmalign-mxsize-bacteria", min=1),
 
@@ -196,6 +148,8 @@ def cmd_run(
     skip_package_ref: bool = typer.Option(False, "--skip-package-ref", help="Stop after HMM-build."),
 
     skip_ko_table: bool = typer.Option(False, "--skip-ko-table", help="Stop after package-ref."),
+    skip_ec_table: bool = typer.Option(False, "--skip-ec-table", help="Stop after KO table."),
+
     eggnog_existing_dir: Path | None = typer.Option(
         None,
         "--eggnog-existing-dir",
@@ -209,13 +163,13 @@ def cmd_run(
     allow_missing_eggnog: bool = typer.Option(
         False,
         "--allow-missing-eggnog",
-        help="Allow genomes without matching eggNOG annotations and write zero-filled KO rows.",
+        help="Allow genomes without matching eggNOG annotations and write zero-filled trait rows.",
     ),
 
     force: bool = typer.Option(False, "--force"),
 ) -> None:
     """
-    Run MAGPIE workflow through final PICRUSt2 marker-reference packaging and KO table construction.
+    Run MAGPIE workflow through marker-reference packaging, KO table creation, and EC table creation.
     """
     _validate_checkm_reuse_args(
         checkm_qa=checkm_qa,
@@ -240,6 +194,7 @@ def cmd_run(
     hmm_build_dir = out / "14_hmm_build"
     package_ref_dir = out / "15_package_ref"
     ko_table_dir = out / "16_ko_table"
+    ec_table_dir = out / "17_ec_table"
 
     require_gtdbtk = gtdb_classify is None
     reuse_provided = (
@@ -250,49 +205,23 @@ def cmd_run(
     )
     require_checkm = (not skip_qc) and (not reuse_provided)
 
-    _LOGGER.info("Step 1/16: validate -> %s", validate_dir)
-    validate_step(
-        mags=mags,
-        out=validate_dir,
-        force=force,
-        require_gtdbtk=require_gtdbtk,
-        require_checkm=require_checkm,
-    )
+    _LOGGER.info("Step 1/17: validate -> %s", validate_dir)
+    validate_step(mags=mags, out=validate_dir, force=force, require_gtdbtk=require_gtdbtk, require_checkm=require_checkm)
 
-    _LOGGER.info("Step 2/16: prep -> %s", prep_dir)
-    prep_step(
-        mags=mags,
-        out=prep_dir,
-        rename_map=rename_map,
-        force=force,
-        sequential_ids=sequential_ids,
-        out_prefix=out_prefix,
-        pad=pad,
-    )
+    _LOGGER.info("Step 2/17: prep -> %s", prep_dir)
+    prep_step(mags=mags, out=prep_dir, rename_map=rename_map, force=force, sequential_ids=sequential_ids, out_prefix=out_prefix, pad=pad)
 
-    _LOGGER.info("Step 3/16: gtdbtk -> %s", gtdb_dir)
-    classify_dir = gtdbtk_step(
-        mags_dir=prep_dir / "mags",
-        out=gtdb_dir,
-        gtdb_classify=gtdb_classify,
-        cpus=cpus,
-        force=force,
-    )
+    _LOGGER.info("Step 3/17: gtdbtk -> %s", gtdb_dir)
+    classify_dir = gtdbtk_step(mags_dir=prep_dir / "mags", out=gtdb_dir, gtdb_classify=gtdb_classify, cpus=cpus, force=force)
 
-    _LOGGER.info("Step 4/16: taxonomy -> %s", tax_dir)
-    taxonomy_step(
-        prep_dir=prep_dir,
-        classify_dir=classify_dir,
-        out=tax_dir,
-        force=force,
-        move_files=move_tax_split,
-    )
+    _LOGGER.info("Step 4/17: taxonomy -> %s", tax_dir)
+    taxonomy_step(prep_dir=prep_dir, classify_dir=classify_dir, out=tax_dir, force=force, move_files=move_tax_split)
 
     if skip_qc:
         _LOGGER.warning("Skipping QC (--skip-qc).")
         return
 
-    _LOGGER.info("Step 5/16: qc -> %s", qc_dir)
+    _LOGGER.info("Step 5/17: qc -> %s", qc_dir)
     qc_step(
         tax_dir=tax_dir,
         out=qc_dir,
@@ -312,21 +241,14 @@ def cmd_run(
         _LOGGER.warning("Skipping Barrnap (--skip-barrnap).")
         return
 
-    _LOGGER.info("Step 6/16: barrnap -> %s", barrnap_dir)
-    barrnap_step(
-        qc_dir=qc_dir,
-        out=barrnap_dir,
-        cpus=cpus,
-        force=force,
-        barrnap_bin=barrnap_bin,
-        reject=barrnap_reject,
-    )
+    _LOGGER.info("Step 6/17: barrnap -> %s", barrnap_dir)
+    barrnap_step(qc_dir=qc_dir, out=barrnap_dir, cpus=cpus, force=force, barrnap_bin=barrnap_bin, reject=barrnap_reject)
 
     if skip_rrna:
         _LOGGER.warning("Skipping rrna (--skip-rrna).")
         return
 
-    _LOGGER.info("Step 7/16: rrna -> %s", rrna_dir)
+    _LOGGER.info("Step 7/17: rrna -> %s", rrna_dir)
     rrna_step(
         barrnap_dir=barrnap_dir,
         out=rrna_dir,
@@ -341,7 +263,7 @@ def cmd_run(
         _LOGGER.warning("Skipping align (--skip-align).")
         return
 
-    _LOGGER.info("Step 8/16: align -> %s", align_dir)
+    _LOGGER.info("Step 8/17: align -> %s", align_dir)
     align_step(
         rrna_dir=rrna_dir,
         out=align_dir,
@@ -358,88 +280,49 @@ def cmd_run(
         _LOGGER.warning("Skipping choose-best (--skip-choose-best).")
         return
 
-    _LOGGER.info("Step 9/16: choose-best -> %s", choose_best_dir)
-    choose_best_step(
-        prep_dir=prep_dir,
-        qc_dir=qc_dir,
-        rrna_dir=rrna_dir,
-        align_dir=align_dir,
-        out=choose_best_dir,
-        force=force,
-    )
+    _LOGGER.info("Step 9/17: choose-best -> %s", choose_best_dir)
+    choose_best_step(prep_dir=prep_dir, qc_dir=qc_dir, rrna_dir=rrna_dir, align_dir=align_dir, out=choose_best_dir, force=force)
 
     if skip_raxml_check:
         _LOGGER.warning("Skipping raxml-check (--skip-raxml-check).")
         return
 
-    _LOGGER.info("Step 10/16: raxml-check -> %s", raxml_dir)
-    raxml_check_step(
-        choose_best_dir=choose_best_dir,
-        out=raxml_dir,
-        raxml_ng_bin=raxml_ng_bin,
-        threads=cpus,
-        force=force,
-    )
+    _LOGGER.info("Step 10/17: raxml-check -> %s", raxml_dir)
+    raxml_check_step(choose_best_dir=choose_best_dir, out=raxml_dir, raxml_ng_bin=raxml_ng_bin, threads=cpus, force=force)
 
     if skip_iqtree:
         _LOGGER.warning("Skipping iqtree (--skip-iqtree).")
         return
 
-    _LOGGER.info("Step 11/16: iqtree -> %s", iqtree_dir)
-    iqtree_step(
-        raxml_check_dir=raxml_dir,
-        out=iqtree_dir,
-        iqtree_bin=iqtree_bin,
-        threads=cpus,
-        bootstrap=iqtree_bootstrap,
-        seed=iqtree_seed,
-        force=force,
-    )
+    _LOGGER.info("Step 11/17: iqtree -> %s", iqtree_dir)
+    iqtree_step(raxml_check_dir=raxml_dir, out=iqtree_dir, iqtree_bin=iqtree_bin, threads=cpus, bootstrap=iqtree_bootstrap, seed=iqtree_seed, force=force)
 
     if skip_raxml_evaluate:
         _LOGGER.warning("Skipping raxml-evaluate (--skip-raxml-evaluate).")
         return
 
-    _LOGGER.info("Step 12/16: raxml-evaluate -> %s", raxml_eval_dir)
-    raxml_evaluate_step(
-        raxml_check_dir=raxml_dir,
-        iqtree_dir=iqtree_dir,
-        out=raxml_eval_dir,
-        raxml_ng_bin=raxml_ng_bin,
-        threads=cpus,
-        force=force,
-    )
+    _LOGGER.info("Step 12/17: raxml-evaluate -> %s", raxml_eval_dir)
+    raxml_evaluate_step(raxml_check_dir=raxml_dir, iqtree_dir=iqtree_dir, out=raxml_eval_dir, raxml_ng_bin=raxml_ng_bin, threads=cpus, force=force)
 
     if skip_hmm_prep:
         _LOGGER.warning("Skipping hmm-prep (--skip-hmm-prep).")
         return
 
-    _LOGGER.info("Step 13/16: hmm-prep -> %s", hmm_prep_dir)
-    hmm_prep_step(
-        raxml_check_dir=raxml_dir,
-        out=hmm_prep_dir,
-        esl_reformat_bin=esl_reformat_bin,
-        force=force,
-    )
+    _LOGGER.info("Step 13/17: hmm-prep -> %s", hmm_prep_dir)
+    hmm_prep_step(raxml_check_dir=raxml_dir, out=hmm_prep_dir, esl_reformat_bin=esl_reformat_bin, force=force)
 
     if skip_hmm_build:
         _LOGGER.warning("Skipping hmm-build (--skip-hmm-build).")
         return
 
-    _LOGGER.info("Step 14/16: hmm-build -> %s", hmm_build_dir)
-    hmm_build_step(
-        hmm_prep_dir=hmm_prep_dir,
-        out=hmm_build_dir,
-        hmmbuild_bin=hmmbuild_bin,
-        cpus=cpus,
-        force=force,
-    )
+    _LOGGER.info("Step 14/17: hmm-build -> %s", hmm_build_dir)
+    hmm_build_step(hmm_prep_dir=hmm_prep_dir, out=hmm_build_dir, hmmbuild_bin=hmmbuild_bin, cpus=cpus, force=force)
 
     if skip_package_ref:
         _LOGGER.warning("Skipping package-ref (--skip-package-ref).")
         return
 
-    _LOGGER.info("Step 15/16: package-ref -> %s", package_ref_dir)
+    _LOGGER.info("Step 15/17: package-ref -> %s", package_ref_dir)
     package_ref_step(
         rrna_dir=rrna_dir,
         iqtree_dir=iqtree_dir,
@@ -455,15 +338,26 @@ def cmd_run(
         return
 
     if eggnog_existing_dir is None:
-        raise typer.BadParameter(
-            "To build KO tables, provide --eggnog-existing-dir or use --skip-ko-table."
-        )
+        raise typer.BadParameter("To build KO/EC tables, provide --eggnog-existing-dir or use --skip-ko-table.")
 
-    _LOGGER.info("Step 16/16: ko-table -> %s", ko_table_dir)
+    _LOGGER.info("Step 16/17: ko-table -> %s", ko_table_dir)
     ko_table_step(
         package_ref_dir=package_ref_dir,
         eggnog_existing_dir=eggnog_existing_dir,
         out=ko_table_dir,
+        force=force,
+        allow_missing_eggnog=allow_missing_eggnog,
+    )
+
+    if skip_ec_table:
+        _LOGGER.warning("Skipping ec-table (--skip-ec-table).")
+        return
+
+    _LOGGER.info("Step 17/17: ec-table -> %s", ec_table_dir)
+    ec_table_step(
+        package_ref_dir=package_ref_dir,
+        eggnog_existing_dir=eggnog_existing_dir,
+        out=ec_table_dir,
         force=force,
         allow_missing_eggnog=allow_missing_eggnog,
     )
@@ -473,43 +367,32 @@ def cmd_run(
 
 @app.command("ko-table")
 def cmd_ko_table(
-    package_ref_dir: Path = typer.Option(
-        ...,
-        "--package-ref-dir",
-        exists=True,
-        file_okay=False,
-        dir_okay=True,
-        readable=True,
-        resolve_path=True,
-        help="MAGPIE package-ref output directory, e.g. out/15_package_ref.",
-    ),
-    eggnog_existing_dir: Path = typer.Option(
-        ...,
-        "--eggnog-existing-dir",
-        exists=True,
-        file_okay=False,
-        dir_okay=True,
-        readable=True,
-        resolve_path=True,
-        help="Directory containing existing eggNOG files named <genome_id>.emapper.annotations.",
-    ),
-    out: Path = typer.Option(
-        ...,
-        "--out",
-        file_okay=False,
-        dir_okay=True,
-        resolve_path=True,
-        help="Output directory for KO table reports, e.g. out/16_ko_table.",
-    ),
-    allow_missing_eggnog: bool = typer.Option(
-        False,
-        "--allow-missing-eggnog",
-        help="Allow genomes without matching eggNOG annotations and write zero-filled KO rows.",
-    ),
+    package_ref_dir: Path = typer.Option(..., "--package-ref-dir", exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True),
+    eggnog_existing_dir: Path = typer.Option(..., "--eggnog-existing-dir", exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True),
+    out: Path = typer.Option(..., "--out", file_okay=False, dir_okay=True, resolve_path=True),
+    allow_missing_eggnog: bool = typer.Option(False, "--allow-missing-eggnog"),
     force: bool = typer.Option(False, "--force"),
 ) -> None:
     """Build PICRUSt2-style ko.txt.gz tables from existing eggNOG annotations."""
     ko_table_step(
+        package_ref_dir=package_ref_dir,
+        eggnog_existing_dir=eggnog_existing_dir,
+        out=out,
+        force=force,
+        allow_missing_eggnog=allow_missing_eggnog,
+    )
+
+
+@app.command("ec-table")
+def cmd_ec_table(
+    package_ref_dir: Path = typer.Option(..., "--package-ref-dir", exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True),
+    eggnog_existing_dir: Path = typer.Option(..., "--eggnog-existing-dir", exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True),
+    out: Path = typer.Option(..., "--out", file_okay=False, dir_okay=True, resolve_path=True),
+    allow_missing_eggnog: bool = typer.Option(False, "--allow-missing-eggnog"),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Build PICRUSt2-style ec.txt.gz tables from existing eggNOG annotations."""
+    ec_table_step(
         package_ref_dir=package_ref_dir,
         eggnog_existing_dir=eggnog_existing_dir,
         out=out,
