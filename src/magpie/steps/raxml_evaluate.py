@@ -206,6 +206,7 @@ def raxml_evaluate_step(
             "iqtree_dir": str(iqtree_dir),
             "raxml_ng_bin": raxml_ng_bin,
             "threads": threads,
+            "force": force,
         },
         "domains": {},
         "outputs": {
@@ -227,6 +228,7 @@ def raxml_evaluate_step(
             out_dir=out,
             raxml_ng_bin=raxml_ng_bin,
             threads=threads,
+            force=force,
         )
 
         report["domains"][domain] = stats
