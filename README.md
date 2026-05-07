@@ -1,6 +1,6 @@
 ![Version](https://img.shields.io/badge/version-0.1.1-blue)
 
-# MAG-based PICRUSt2-Integrated Extension (MAGPIE)
+# MAG-based PICRUSt2 Integrated Extension (MAGPIE)
 
 *Work in progress tool*
 
