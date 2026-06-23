@@ -4,7 +4,7 @@ import csv
 import gzip
 import json
 import logging
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
 
@@ -36,27 +36,16 @@ def _read_fasta_ids(path: Path) -> List[str]:
 
 
 def _extract_genome_id_from_annotation_filename(path: Path) -> str:
-    """
-    Examples:
-      MAG0001.emapper.annotations     -> MAG0001
-      MAG0001.emapper.annotations.gz  -> MAG0001
-    """
     name = path.name
-
     if name.endswith(".gz"):
         name = name[:-3]
-
     if ".emapper" in name:
         return name.split(".emapper", 1)[0]
-
     return name.split(".", 1)[0]
 
 
 def _iter_annotation_files(ann_dir: Path) -> Iterable[Path]:
-    patterns = [
-        "*.emapper.annotations",
-        "*.emapper.annotations.gz",
-    ]
+    patterns = ["*.emapper.annotations", "*.emapper.annotations.gz"]
 
     seen: set[Path] = set()
     for pattern in patterns:
@@ -98,9 +87,6 @@ def _split_kegg_ko_field(kfield: str) -> List[str]:
 
 
 def _parse_one_eggnog_annotation(path: Path) -> Counter:
-    """
-    Parse one eggNOG-mapper .emapper.annotations file and count KO occurrences.
-    """
     counts: Counter = Counter()
     ko_idx = None
     header_found = False
@@ -139,11 +125,8 @@ def _parse_one_eggnog_annotation(path: Path) -> Counter:
 
 
 def _parse_eggnog_dir(ann_dir: Path) -> Dict[str, Counter]:
-    """
-    Return:
-      genome_id -> Counter(KO -> copy_number)
-    """
     ann_files = list(_iter_annotation_files(ann_dir))
+
     if not ann_files:
         raise FileNotFoundError(f"No *.emapper.annotations files found in: {ann_dir}")
 
@@ -158,10 +141,31 @@ def _parse_eggnog_dir(ann_dir: Path) -> Dict[str, Counter]:
                 f"MAGPIE requires one annotation file per genome ID."
             )
 
-        _LOGGER.info("Parsing eggNOG annotation: %s -> %s", ann, gid)
+        _LOGGER.info("Parsing eggNOG KO annotation: %s -> %s", ann, gid)
         out[gid] = _parse_one_eggnog_annotation(ann)
 
     return out
+
+
+def _nonconstant_traits(
+    *,
+    genome_ids: List[str],
+    all_counts: Dict[str, Counter],
+    traits: List[str],
+) -> List[str]:
+    """
+    Keep only traits with more than one distinct value across included genomes.
+
+    This removes all-zero columns and constant non-zero columns.
+    """
+    kept: List[str] = []
+
+    for trait in traits:
+        values = {all_counts.get(gid, Counter()).get(trait, 0) for gid in genome_ids}
+        if len(values) > 1:
+            kept.append(trait)
+
+    return kept
 
 
 def _write_ko_table(
@@ -170,14 +174,7 @@ def _write_ko_table(
     all_counts: Dict[str, Counter],
     out_path: Path,
     allow_missing_annotations: bool,
-) -> Tuple[int, int, int]:
-    """
-    Write PICRUSt2-style KO table:
-      assembly    ko:K00001    ko:K00002 ...
-
-    Returns:
-      n_genomes_written, n_kos, n_missing_annotations
-    """
+) -> Tuple[int, int, int, int]:
     missing = [gid for gid in genome_ids if gid not in all_counts]
 
     if missing and not allow_missing_annotations:
@@ -193,18 +190,31 @@ def _write_ko_table(
         if gid in all_counts:
             kos.update(all_counts[gid].keys())
 
-    sorted_kos = sorted(kos)
+    sorted_kos_all = sorted(kos)
+    sorted_kos_kept = _nonconstant_traits(
+        genome_ids=genome_ids,
+        all_counts=all_counts,
+        traits=sorted_kos_all,
+    )
+
+    n_removed_constant = len(sorted_kos_all) - len(sorted_kos_kept)
+
+    if sorted_kos_all and not sorted_kos_kept:
+        raise ValueError(
+            f"All KO columns were constant for {out_path}. "
+            f"PICRUSt2/Castor requires variable trait columns."
+        )
 
     with gzip.open(out_path, "wt", encoding="utf-8") as out:
-        header = ["assembly"] + [f"ko:{ko}" for ko in sorted_kos]
+        header = ["assembly"] + [f"ko:{ko}" for ko in sorted_kos_kept]
         out.write("\t".join(header) + "\n")
 
         for gid in genome_ids:
             counter = all_counts.get(gid, Counter())
-            row = [gid] + [str(counter.get(ko, 0)) for ko in sorted_kos]
+            row = [gid] + [str(counter.get(ko, 0)) for ko in sorted_kos_kept]
             out.write("\t".join(row) + "\n")
 
-    return len(genome_ids), len(sorted_kos), len(missing)
+    return len(genome_ids), len(sorted_kos_kept), len(missing), n_removed_constant
 
 
 def ko_table_step(
@@ -215,20 +225,6 @@ def ko_table_step(
     force: bool,
     allow_missing_eggnog: bool,
 ) -> None:
-    """
-    Build PICRUSt2-style KO trait tables from existing eggNOG annotations.
-
-    Inputs:
-      package_ref_dir/bac_ref/bac_ref.fna
-      package_ref_dir/arc_ref/arc_ref.fna
-      eggnog_existing_dir/*.emapper.annotations
-
-    Outputs:
-      package_ref_dir/bac_ref/ko.txt.gz
-      package_ref_dir/arc_ref/ko.txt.gz
-      out/summary.tsv
-      out/report.json
-    """
     bac_fasta = package_ref_dir / "bac_ref" / "bac_ref.fna"
     arc_fasta = package_ref_dir / "arc_ref" / "arc_ref.fna"
 
@@ -269,7 +265,7 @@ def ko_table_step(
     all_counts = _parse_eggnog_dir(eggnog_existing_dir)
 
     _LOGGER.info("Writing bacterial KO table: %s", bac_out)
-    bac_n, bac_kos, bac_missing = _write_ko_table(
+    bac_n, bac_kos, bac_missing, bac_removed = _write_ko_table(
         genome_ids=bac_ids,
         all_counts=all_counts,
         out_path=bac_out,
@@ -277,7 +273,7 @@ def ko_table_step(
     )
 
     _LOGGER.info("Writing archaeal KO table: %s", arc_out)
-    arc_n, arc_kos, arc_missing = _write_ko_table(
+    arc_n, arc_kos, arc_missing, arc_removed = _write_ko_table(
         genome_ids=arc_ids,
         all_counts=all_counts,
         out_path=arc_out,
@@ -285,8 +281,8 @@ def ko_table_step(
     )
 
     rows = [
-        ["bacteria", str(bac_n), str(bac_kos), str(bac_missing), str(bac_fasta), str(bac_out)],
-        ["archaea", str(arc_n), str(arc_kos), str(arc_missing), str(arc_fasta), str(arc_out)],
+        ["bacteria", str(bac_n), str(bac_kos), str(bac_removed), str(bac_missing), str(bac_fasta), str(bac_out)],
+        ["archaea", str(arc_n), str(arc_kos), str(arc_removed), str(arc_missing), str(arc_fasta), str(arc_out)],
     ]
 
     with (out / "summary.tsv").open("w", encoding="utf-8", newline="") as fh:
@@ -295,6 +291,7 @@ def ko_table_step(
             "domain",
             "n_genomes",
             "n_kos",
+            "n_constant_kos_removed",
             "n_missing_annotations",
             "reference_fasta",
             "ko_table",
@@ -306,6 +303,7 @@ def ko_table_step(
             "package_ref_dir": str(package_ref_dir),
             "eggnog_existing_dir": str(eggnog_existing_dir),
             "allow_missing_eggnog": allow_missing_eggnog,
+            "constant_trait_filter": True,
         },
         "outputs": {
             "bacteria_ko": str(bac_out),
@@ -317,8 +315,10 @@ def ko_table_step(
             "annotation_files_parsed": len(all_counts),
             "bacteria_genomes": bac_n,
             "archaea_genomes": arc_n,
-            "bacteria_kos": bac_kos,
-            "archaea_kos": arc_kos,
+            "bacteria_kos_retained": bac_kos,
+            "archaea_kos_retained": arc_kos,
+            "bacteria_constant_kos_removed": bac_removed,
+            "archaea_constant_kos_removed": arc_removed,
             "bacteria_missing_annotations": bac_missing,
             "archaea_missing_annotations": arc_missing,
         },
@@ -327,9 +327,12 @@ def ko_table_step(
     (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     _LOGGER.info(
-        "KO table step complete. Bacteria: %d genomes, %d KOs. Archaea: %d genomes, %d KOs.",
+        "KO table step complete. Bacteria: %d genomes, %d KOs retained, %d constant removed. "
+        "Archaea: %d genomes, %d KOs retained, %d constant removed.",
         bac_n,
         bac_kos,
+        bac_removed,
         arc_n,
         arc_kos,
+        arc_removed,
     )

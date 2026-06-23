@@ -39,27 +39,16 @@ def _read_fasta_ids(path: Path) -> List[str]:
 
 
 def _extract_genome_id_from_annotation_filename(path: Path) -> str:
-    """
-    Examples:
-      MAG0001.emapper.annotations     -> MAG0001
-      MAG0001.emapper.annotations.gz  -> MAG0001
-    """
     name = path.name
-
     if name.endswith(".gz"):
         name = name[:-3]
-
     if ".emapper" in name:
         return name.split(".emapper", 1)[0]
-
     return name.split(".", 1)[0]
 
 
 def _iter_annotation_files(ann_dir: Path) -> Iterable[Path]:
-    patterns = [
-        "*.emapper.annotations",
-        "*.emapper.annotations.gz",
-    ]
+    patterns = ["*.emapper.annotations", "*.emapper.annotations.gz"]
 
     seen: set[Path] = set()
     for pattern in patterns:
@@ -71,7 +60,6 @@ def _iter_annotation_files(ann_dir: Path) -> Iterable[Path]:
 
 def _split_multi_value_field(field: str) -> List[str]:
     field = field.strip()
-
     if not field or field == "-" or field.upper() == "NA":
         return []
 
@@ -81,7 +69,6 @@ def _split_multi_value_field(field: str) -> List[str]:
 
 def _normalise_ec(ec: str) -> str | None:
     ec = ec.strip()
-
     if not ec or ec == "-" or ec.upper() == "NA":
         return None
 
@@ -95,9 +82,6 @@ def _normalise_ec(ec: str) -> str | None:
 
 
 def _find_ec_column(cols: List[str]) -> int | None:
-    """
-    Try common eggNOG EC column names.
-    """
     candidates = ["EC", "EC_number", "ECs"]
 
     for c in candidates:
@@ -108,9 +92,6 @@ def _find_ec_column(cols: List[str]) -> int | None:
 
 
 def _parse_one_eggnog_annotation(path: Path) -> Counter:
-    """
-    Parse one eggNOG-mapper .emapper.annotations file and count EC occurrences.
-    """
     counts: Counter = Counter()
     ec_idx = None
     header_found = False
@@ -118,7 +99,6 @@ def _parse_one_eggnog_annotation(path: Path) -> Counter:
     with _open_text_maybe_gzip(path) as fh:
         for raw in fh:
             line = raw.rstrip("\n")
-
             if not line:
                 continue
 
@@ -152,10 +132,6 @@ def _parse_one_eggnog_annotation(path: Path) -> Counter:
 
 
 def _parse_eggnog_dir(ann_dir: Path) -> Dict[str, Counter]:
-    """
-    Return:
-      genome_id -> Counter(EC -> copy_number)
-    """
     ann_files = list(_iter_annotation_files(ann_dir))
 
     if not ann_files:
@@ -178,20 +154,35 @@ def _parse_eggnog_dir(ann_dir: Path) -> Dict[str, Counter]:
     return out
 
 
+def _nonconstant_traits(
+    *,
+    genome_ids: List[str],
+    all_counts: Dict[str, Counter],
+    traits: List[str],
+) -> List[str]:
+    """
+    Keep only traits with more than one distinct value across included genomes.
+
+    This removes all-zero columns and also constant non-zero columns, e.g.
+    1,1,1 or 3,3,3, which can break PICRUSt2/Castor MP HSP.
+    """
+    kept: List[str] = []
+
+    for trait in traits:
+        values = {all_counts.get(gid, Counter()).get(trait, 0) for gid in genome_ids}
+        if len(values) > 1:
+            kept.append(trait)
+
+    return kept
+
+
 def _write_ec_table(
     *,
     genome_ids: List[str],
     all_counts: Dict[str, Counter],
     out_path: Path,
     allow_missing_annotations: bool,
-) -> Tuple[int, int, int]:
-    """
-    Write PICRUSt2-style EC table:
-      assembly    1.1.1.1    1.1.1.2 ...
-
-    Returns:
-      n_genomes_written, n_ecs, n_missing_annotations
-    """
+) -> Tuple[int, int, int, int]:
     missing = [gid for gid in genome_ids if gid not in all_counts]
 
     if missing and not allow_missing_annotations:
@@ -207,18 +198,31 @@ def _write_ec_table(
         if gid in all_counts:
             ecs.update(all_counts[gid].keys())
 
-    sorted_ecs = sorted(ecs)
+    sorted_ecs_all = sorted(ecs)
+    sorted_ecs_kept = _nonconstant_traits(
+        genome_ids=genome_ids,
+        all_counts=all_counts,
+        traits=sorted_ecs_all,
+    )
+
+    n_removed_constant = len(sorted_ecs_all) - len(sorted_ecs_kept)
+
+    if sorted_ecs_all and not sorted_ecs_kept:
+        raise ValueError(
+            f"All EC columns were constant for {out_path}. "
+            f"PICRUSt2/Castor requires variable trait columns."
+        )
 
     with gzip.open(out_path, "wt", encoding="utf-8") as out:
-        header = ["assembly"] + sorted_ecs
+        header = ["assembly"] + sorted_ecs_kept
         out.write("\t".join(header) + "\n")
 
         for gid in genome_ids:
             counter = all_counts.get(gid, Counter())
-            row = [gid] + [str(counter.get(ec, 0)) for ec in sorted_ecs]
+            row = [gid] + [str(counter.get(ec, 0)) for ec in sorted_ecs_kept]
             out.write("\t".join(row) + "\n")
 
-    return len(genome_ids), len(sorted_ecs), len(missing)
+    return len(genome_ids), len(sorted_ecs_kept), len(missing), n_removed_constant
 
 
 def ec_table_step(
@@ -229,20 +233,6 @@ def ec_table_step(
     force: bool,
     allow_missing_eggnog: bool,
 ) -> None:
-    """
-    Build PICRUSt2-style EC trait tables from existing eggNOG annotations.
-
-    Inputs:
-      package_ref_dir/bac_ref/bac_ref.fna
-      package_ref_dir/arc_ref/arc_ref.fna
-      eggnog_existing_dir/*.emapper.annotations
-
-    Outputs:
-      package_ref_dir/bac_ref/ec.txt.gz
-      package_ref_dir/arc_ref/ec.txt.gz
-      out/summary.tsv
-      out/report.json
-    """
     bac_fasta = package_ref_dir / "bac_ref" / "bac_ref.fna"
     arc_fasta = package_ref_dir / "arc_ref" / "arc_ref.fna"
 
@@ -278,14 +268,14 @@ def ec_table_step(
 
     all_counts = _parse_eggnog_dir(eggnog_existing_dir)
 
-    bac_n, bac_ecs, bac_missing = _write_ec_table(
+    bac_n, bac_ecs, bac_missing, bac_removed = _write_ec_table(
         genome_ids=bac_ids,
         all_counts=all_counts,
         out_path=bac_out,
         allow_missing_annotations=allow_missing_eggnog,
     )
 
-    arc_n, arc_ecs, arc_missing = _write_ec_table(
+    arc_n, arc_ecs, arc_missing, arc_removed = _write_ec_table(
         genome_ids=arc_ids,
         all_counts=all_counts,
         out_path=arc_out,
@@ -293,8 +283,8 @@ def ec_table_step(
     )
 
     rows = [
-        ["bacteria", str(bac_n), str(bac_ecs), str(bac_missing), str(bac_fasta), str(bac_out)],
-        ["archaea", str(arc_n), str(arc_ecs), str(arc_missing), str(arc_fasta), str(arc_out)],
+        ["bacteria", str(bac_n), str(bac_ecs), str(bac_removed), str(bac_missing), str(bac_fasta), str(bac_out)],
+        ["archaea", str(arc_n), str(arc_ecs), str(arc_removed), str(arc_missing), str(arc_fasta), str(arc_out)],
     ]
 
     with (out / "summary.tsv").open("w", encoding="utf-8", newline="") as fh:
@@ -303,6 +293,7 @@ def ec_table_step(
             "domain",
             "n_genomes",
             "n_ecs",
+            "n_constant_ecs_removed",
             "n_missing_annotations",
             "reference_fasta",
             "ec_table",
@@ -314,6 +305,7 @@ def ec_table_step(
             "package_ref_dir": str(package_ref_dir),
             "eggnog_existing_dir": str(eggnog_existing_dir),
             "allow_missing_eggnog": allow_missing_eggnog,
+            "constant_trait_filter": True,
         },
         "outputs": {
             "bacteria_ec": str(bac_out),
@@ -325,8 +317,10 @@ def ec_table_step(
             "annotation_files_parsed": len(all_counts),
             "bacteria_genomes": bac_n,
             "archaea_genomes": arc_n,
-            "bacteria_ecs": bac_ecs,
-            "archaea_ecs": arc_ecs,
+            "bacteria_ecs_retained": bac_ecs,
+            "archaea_ecs_retained": arc_ecs,
+            "bacteria_constant_ecs_removed": bac_removed,
+            "archaea_constant_ecs_removed": arc_removed,
             "bacteria_missing_annotations": bac_missing,
             "archaea_missing_annotations": arc_missing,
         },
@@ -335,9 +329,12 @@ def ec_table_step(
     (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     _LOGGER.info(
-        "EC table step complete. Bacteria: %d genomes, %d ECs. Archaea: %d genomes, %d ECs.",
+        "EC table step complete. Bacteria: %d genomes, %d ECs retained, %d constant removed. "
+        "Archaea: %d genomes, %d ECs retained, %d constant removed.",
         bac_n,
         bac_ecs,
+        bac_removed,
         arc_n,
         arc_ecs,
+        arc_removed,
     )

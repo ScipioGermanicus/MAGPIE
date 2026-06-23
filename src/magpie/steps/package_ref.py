@@ -27,9 +27,28 @@ def _read_fasta_ids(path: Path) -> List[str]:
     return ids
 
 
+def _normalise_copy_id(raw: str) -> str:
+    s = raw.strip()
+
+    if s.endswith(".gz"):
+        s = s[:-3]
+
+    for suffix in (".fasta", ".fna", ".fa"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+
+    for suffix in ("_16S", "_genomic"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+
+    return s
+
+
 def _read_copy_table(path: Path) -> Dict[str, int]:
     out: Dict[str, int] = {}
+
     if not path.exists():
+        _LOGGER.warning("16S copy-count input table does not exist: %s", path)
         return out
 
     with path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -37,15 +56,34 @@ def _read_copy_table(path: Path) -> Dict[str, int]:
             line = raw.strip()
             if not line:
                 continue
+
             parts = line.split("\t")
             if len(parts) < 2:
                 continue
-            gid = parts[0].strip()
+
+            raw_gid = parts[0].strip()
+            raw_count = parts[1].strip()
+
+            if raw_gid.lower() in {"assembly", "genome", "genome_id"}:
+                continue
+
             try:
-                count = int(float(parts[1].strip()))
+                count = int(float(raw_count))
             except ValueError:
                 continue
+
+            gid = _normalise_copy_id(raw_gid)
+
+            if gid in out:
+                _LOGGER.warning(
+                    "Duplicate 16S copy-count ID after normalisation in %s: %s. Keeping first value.",
+                    path,
+                    gid,
+                )
+                continue
+
             out[gid] = count
+
     return out
 
 
@@ -55,33 +93,74 @@ def _write_filtered_copy_table(
     copy_table_in: Path,
     out_path: Path,
 ) -> Tuple[int, int]:
-    """
-    Write filtered copy table with columns:
-      assembly    16S_rRNA_Count
-    Counts >10 are capped to 10.
-    Returns:
-      (n_written, n_capped)
-    """
     copies = _read_copy_table(copy_table_in)
 
     n_written = 0
     n_capped = 0
+    missing: List[str] = []
 
     with out_path.open("w", encoding="utf-8", newline="") as fh:
         w = csv.writer(fh, delimiter="\t")
         w.writerow(["assembly", "16S_rRNA_Count"])
 
         for gid in included_genomes:
-            if gid not in copies:
+            norm_gid = _normalise_copy_id(gid)
+
+            if norm_gid not in copies:
+                missing.append(gid)
                 continue
-            count = copies[gid]
+
+            count = copies[norm_gid]
+
             if count > 10:
                 count = 10
                 n_capped += 1
+
             w.writerow([gid, str(count)])
             n_written += 1
 
+    if included_genomes and n_written == 0:
+        preview_ids = ", ".join(included_genomes[:10])
+        preview_copy_ids = ", ".join(sorted(copies.keys())[:10])
+        raise ValueError(
+            f"No 16S copy-count rows matched the final reference FASTA IDs for {out_path}.\n"
+            f"Input copy table: {copy_table_in}\n"
+            f"First final FASTA IDs: {preview_ids}\n"
+            f"First copy-table IDs after normalisation: {preview_copy_ids}\n"
+            f"This usually indicates that rrna IDs and final reference FASTA IDs are not using the same genome ID convention."
+        )
+
+    if missing:
+        _LOGGER.warning(
+            "%d final reference genomes had no 16S copy-count row for %s. First missing: %s",
+            len(missing),
+            out_path,
+            ", ".join(missing[:10]),
+        )
+
     return (n_written, n_capped)
+
+
+def _resolve_copy_table(rrna_dir: Path, domain: str) -> Path:
+    candidates = [
+        rrna_dir / f"{domain}_16S_copies.txt",
+        rrna_dir / f"{domain}_16S_copies.tsv",
+        rrna_dir / domain / f"{domain}_16S_copies.txt",
+        rrna_dir / domain / f"{domain}_16S_copies.tsv",
+        rrna_dir / domain / "16S_copies.txt",
+        rrna_dir / domain / "16S_copies.tsv",
+        rrna_dir / domain / "copies.txt",
+        rrna_dir / domain / "copies.tsv",
+    ]
+
+    for p in candidates:
+        if p.exists():
+            return p
+
+    checked = "\n".join(f"  - {p}" for p in candidates)
+    raise FileNotFoundError(
+        f"Could not find 16S copy-count table for {domain}. Checked:\n{checked}"
+    )
 
 
 def _copy_required(src: Path, dst: Path) -> None:
@@ -91,9 +170,6 @@ def _copy_required(src: Path, dst: Path) -> None:
 
 
 def _parse_raxml_ng_log(log_path: Path) -> Dict[str, str]:
-    """
-    Parse a RAxML-NG --evaluate log into fields needed for a RAxML 7.x-style raxml_info.
-    """
     patterns = None
     base_freqs = None
     subs_rates = None
@@ -219,7 +295,7 @@ def _package_one_domain(
     tree_src = iqtree_dir / f"{domain}_16S_iqtree.treefile"
     model_src = raxml_evaluate_dir / f"{domain}_raxml.raxml.bestModel"
     log_src = raxml_evaluate_dir / f"{domain}_raxml.raxml.log"
-    copies_src = rrna_dir / f"{domain}_16S_copies.txt"
+    copies_src = _resolve_copy_table(rrna_dir, domain)
 
     fna_dst = ref_dir / f"{prefix}.fna"
     hmm_dst = ref_dir / f"{prefix}.hmm"
@@ -243,6 +319,7 @@ def _package_one_domain(
 
     fasta_ids = _read_fasta_ids(fna_dst)
     copy_table_dst = out_root / f"{domain}_16S_copies.txt"
+
     n_written, n_capped = _write_filtered_copy_table(
         included_genomes=fasta_ids,
         copy_table_in=copies_src,
@@ -259,6 +336,7 @@ def _package_one_domain(
         "model": str(model_dst),
         "raxml_info": str(info_dst),
         "copies_table": str(copy_table_dst),
+        "copy_table_input": str(copies_src),
         "n_fasta_ids": len(fasta_ids),
         "n_copy_rows_written": n_written,
         "n_copy_rows_capped": n_capped,
@@ -275,15 +353,6 @@ def package_ref_step(
     out: Path,
     force: bool,
 ) -> None:
-    """
-    Package PICRUSt2-style reference folders and auxiliary copy-count tables.
-
-    Outputs:
-      out/bac_ref/*
-      out/arc_ref/*
-      out/bacteria_16S_copies.txt
-      out/archaea_16S_copies.txt
-    """
     key_outputs = [out / "summary.tsv", out / "report.json"]
     if any(p.exists() for p in key_outputs) and not force:
         raise FileExistsError(f"package-ref outputs already exist under {out}. Use --force to overwrite.")
@@ -331,6 +400,7 @@ def package_ref_step(
             str(stats.get("model", "")),
             str(stats.get("raxml_info", "")),
             str(stats.get("copies_table", "")),
+            str(stats.get("copy_table_input", "")),
             str(stats.get("n_fasta_ids", 0)),
             str(stats.get("n_copy_rows_written", 0)),
             str(stats.get("n_copy_rows_capped", 0)),
@@ -348,6 +418,7 @@ def package_ref_step(
             "model",
             "raxml_info",
             "copies_table",
+            "copy_table_input",
             "n_fasta_ids",
             "n_copy_rows_written",
             "n_copy_rows_capped",
