@@ -5,6 +5,7 @@ from pathlib import Path
 
 import typer
 
+from .steps.install_picrust2_ref import install_picrust2_ref_step
 from .steps.validate import validate_step
 from .steps.prep import prep_step
 from .steps.gtdbtk import gtdbtk_step
@@ -400,6 +401,57 @@ def cmd_ec_table(
         allow_missing_eggnog=allow_missing_eggnog,
     )
 
+@app.command("install-picrust2-ref")
+def cmd_install_picrust2_ref(
+    package_ref_dir: Path = typer.Option(
+        ...,
+        "--package-ref-dir",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="MAGPIE package-ref output directory, e.g. out/15_package_ref.",
+    ),
+    picrust2_env: Path = typer.Option(
+        ...,
+        "--picrust2-env",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Path to the PICRUSt2 conda environment whose default files should be replaced.",
+    ),
+    out: Path = typer.Option(
+        ...,
+        "--out",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        help="Output directory for install manifest and optional backups.",
+    ),
+    backup: bool = typer.Option(
+        True,
+        "--backup/--no-backup",
+        help="Back up existing PICRUSt2 default files before replacing them.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Overwrite existing PICRUSt2 default files.",
+    ),
+) -> None:
+    """
+    Install MAGPIE-produced PICRUSt2 reference files into a selected PICRUSt2 conda environment.
+    """
+    install_picrust2_ref_step(
+        package_ref_dir=package_ref_dir,
+        picrust2_env=picrust2_env,
+        out=out,
+        force=force,
+        backup=backup,
+    )
 
 if __name__ == "__main__":
     app()
