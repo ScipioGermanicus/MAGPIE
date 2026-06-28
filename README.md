@@ -12,3 +12,4 @@ This tool is not currently finished. It can create the required reference files 
 Note that you will need to obtain CheckM quality statistics, GTDB-Tk classifications, ssu models, and EggNOG annotations beforehand, as these steps are not yet integrated into MAGPIE. It is therefore necessary to point MAGPIE to existing reference files when running it.
 You also need to add the resulting output files manually to an existing PICRUSt2 conda environment, replacing the old reference files.
 
+Feel free to message me with questions or requests for further developing this tool.
