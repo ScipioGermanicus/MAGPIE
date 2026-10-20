@@ -1,457 +1,208 @@
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
+from typing import List, Optional
 
 import typer
 
-from .steps.install_picrust2_ref import install_picrust2_ref_step
-from .steps.validate import validate_step
-from .steps.prep import prep_step
-from .steps.gtdbtk import gtdbtk_step
-from .steps.taxonomy import taxonomy_step
-from .steps.qc import qc_step
-from .steps.barrnap import barrnap_step
-from .steps.rrna import rrna_step
-from .steps.align import align_step
-from .steps.choose_best import choose_best_step
-from .steps.raxml_check import raxml_check_step
-from .steps.iqtree import iqtree_step
-from .steps.raxml_evaluate import raxml_evaluate_step
-from .steps.hmm_prep import hmm_prep_step
-from .steps.hmm_build import hmm_build_step
-from .steps.package_ref import package_ref_step
-from .steps.ko_table import ko_table_step
-from .steps.ec_table import ec_table_step
+from . import __version__
+from .pipeline import STEP_DIRS, STEP_NAMES, Config, MagpieError, load_saved_config, run_pipeline, status
+from .util.logging import configure_console
 
 app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
-    help="MAGPIE: build components of a custom PICRUSt2 reference database from MAGs.",
+    help="MAGPIE: build a custom PICRUSt2 reference database from MAGs.",
 )
 
 _LOGGER = logging.getLogger("magpie")
 
+DIR_IN = dict(exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True)
+FILE_IN = dict(exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True)
+P_IO, P_STEPS, P_TAX, P_QC, P_16S, P_TREE, P_FUNC, P_BIN = (
+    "Input / output", "Step selection", "Taxonomy (GTDB-Tk)", "Genome quality (CheckM)", "16S rRNA genes",
+    "Alignment, trees and HMMs", "Functional annotation (eggNOG)", "Executables")
 
-def _configure_logging(verbose: bool, debug: bool) -> None:
-    level = logging.WARNING
-    if verbose:
-        level = logging.INFO
-    if debug:
-        level = logging.DEBUG
 
-    root = logging.getLogger()
-    if not root.handlers:
-        logging.basicConfig(
-            level=level,
-            format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        )
-    else:
-        root.setLevel(level)
+def _version(value: bool) -> None:
+    if value:
+        typer.echo(f"magpie {__version__}")
+        raise typer.Exit()
 
 
 @app.callback()
 def main(
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable INFO-level logging."),
-    debug: bool = typer.Option(False, "--debug", help="Enable DEBUG-level logging (very noisy)."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show DEBUG messages on the console."),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Only show warnings and errors."),
+    debug: bool = typer.Option(False, "--debug", hidden=True),
+    version: bool = typer.Option(False, "--version", callback=_version, is_eager=True, help="Print version and exit."),
 ) -> None:
-    _configure_logging(verbose=verbose, debug=debug)
-    _LOGGER.debug("Logging configured (verbose=%s, debug=%s).", verbose, debug)
+    configure_console(logging.DEBUG if (verbose or debug) else logging.WARNING if quiet else logging.INFO)
 
 
-def _validate_checkm_reuse_args(
-    *,
-    checkm_qa: Path | None,
-    checkm_qa_bacteria: Path | None,
-    checkm_qa_archaea: Path | None,
-    checkm_results: Path | None,
-) -> None:
-    if checkm_results is not None:
-        if checkm_qa is not None or checkm_qa_bacteria is not None or checkm_qa_archaea is not None:
-            raise typer.BadParameter("Use either --checkm-results (legacy) OR CheckM QA options, not both.")
+def _run_or_exit(fn) -> None:
+    try:
+        fn()
+    except MagpieError as e:
+        _LOGGER.error("%s", e)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        _LOGGER.error("Interrupted. Rerun the same command to resume.")
+        sys.exit(130)
 
-    if checkm_qa is not None:
-        if checkm_qa_bacteria is not None or checkm_qa_archaea is not None:
-            raise typer.BadParameter("Use either --checkm-qa OR --checkm-qa-bacteria/--checkm-qa-archaea, not both.")
 
-    if (checkm_qa_bacteria is None) ^ (checkm_qa_archaea is None):
-        raise typer.BadParameter("Provide both --checkm-qa-bacteria and --checkm-qa-archaea together.")
+def _steps_option(value: Optional[str]) -> Optional[List[str]]:
+    if value is None:
+        return None
+    return [s.strip() for s in value.replace(" ", ",").split(",") if s.strip()]
 
 
 @app.command("run")
 def cmd_run(
-    mags: Path = typer.Option(..., "--mags", exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True),
-    out: Path = typer.Option(..., "--out", file_okay=False, dir_okay=True, resolve_path=True),
+    ctx: typer.Context,
+    out: Path = typer.Option(..., "--out", file_okay=False, resolve_path=True, rich_help_panel=P_IO,
+                             help="Output directory. Rerunning with the same directory resumes the workflow."),
+    mags: Optional[Path] = typer.Option(None, "--mags", **DIR_IN, rich_help_panel=P_IO,
+                                        help="Directory with MAG FASTA files (.fa/.fna/.fasta, optionally .gz)."),
+    rename_map: Optional[Path] = typer.Option(None, "--rename-map", **FILE_IN, rich_help_panel=P_IO,
+                                              help="TSV: original file name (or ID) <tab> new genome ID."),
+    sequential_ids: bool = typer.Option(False, "--sequential-ids/--no-sequential-ids", rich_help_panel=P_IO,
+                                        help="Rename genomes to MAG0001, MAG0002, ... (files sorted by name)."),
+    out_prefix: str = typer.Option("MAG", "--out-prefix", rich_help_panel=P_IO),
+    pad: int = typer.Option(4, "--pad", min=1, max=12, rich_help_panel=P_IO),
+    cpus: int = typer.Option(8, "--cpus", min=1, rich_help_panel=P_IO, help="CPUs for external tools."),
+    seed: int = typer.Option(100, "--seed", rich_help_panel=P_IO,
+                             help="Seed for the random choices of the workflow (16S copy, tied genomes)."),
 
-    rename_map: Path | None = typer.Option(None, "--rename-map", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
-    sequential_ids: bool = typer.Option(False, "--sequential-ids/--no-sequential-ids"),
-    out_prefix: str = typer.Option("MAG", "--out-prefix"),
-    pad: int = typer.Option(4, "--pad", min=1, max=12),
+    only: Optional[str] = typer.Option(None, "--only", rich_help_panel=P_STEPS,
+                                       help="Run only these steps (comma-separated), e.g. --only barrnap,rrna."),
+    start: Optional[str] = typer.Option(None, "--from", rich_help_panel=P_STEPS,
+                                        help="(Re)run from this step onwards."),
+    stop: Optional[str] = typer.Option(None, "--to", rich_help_panel=P_STEPS,
+                                       help="Stop after this step, e.g. --to package_ref to skip annotation."),
+    force: bool = typer.Option(False, "--force", rich_help_panel=P_STEPS,
+                               help="Recompute steps that are already done (eggNOG annotations are kept)."),
+    reset_options: bool = typer.Option(False, "--reset-options", rich_help_panel=P_STEPS,
+                                       help="Do not reuse the options saved by the previous run in --out."),
 
-    gtdb_classify: Path | None = typer.Option(
-        None,
-        "--gtdb-classify",
-        exists=True,
-        file_okay=False,
-        dir_okay=True,
-        readable=True,
-        resolve_path=True,
-        help="Path to an existing GTDB-Tk classify/ directory. If provided, GTDB-Tk is skipped.",
-    ),
-    cpus: int = typer.Option(8, "--cpus", min=1, help="CPUs for external tools."),
+    gtdb_classify: Optional[Path] = typer.Option(
+        None, "--gtdb-classify", **DIR_IN, rich_help_panel=P_TAX,
+        help="Existing GTDB-Tk results (dir with gtdbtk.bac120/ar53.summary.tsv, or its parent). Skips GTDB-Tk."),
+    pplacer_cpus: Optional[int] = typer.Option(None, "--pplacer-cpus", min=1, rich_help_panel=P_TAX),
 
-    move_tax_split: bool = typer.Option(False, "--move-tax-split"),
+    checkm_qa: Optional[Path] = typer.Option(None, "--checkm-qa", **FILE_IN, rich_help_panel=P_QC,
+                                             help="Existing CheckM QA table for all genomes. Skips CheckM."),
+    checkm_qa_bacteria: Optional[Path] = typer.Option(None, "--checkm-qa-bacteria", **FILE_IN, rich_help_panel=P_QC),
+    checkm_qa_archaea: Optional[Path] = typer.Option(None, "--checkm-qa-archaea", **FILE_IN, rich_help_panel=P_QC),
+    completeness_min: float = typer.Option(90.0, "--completeness-min", rich_help_panel=P_QC),
+    contamination_max: float = typer.Option(10.0, "--contamination-max", rich_help_panel=P_QC),
 
-    skip_qc: bool = typer.Option(False, "--skip-qc", help="Stop after taxonomy."),
+    barrnap_reject: float = typer.Option(0.8, "--barrnap-reject", min=0.0, max=1.0, rich_help_panel=P_16S),
+    multi_cluster_id: float = typer.Option(0.90, "--multi-cluster-id", min=0.0, max=1.0, rich_help_panel=P_16S),
+    final_cluster_id: float = typer.Option(1.0, "--final-cluster-id", min=0.0, max=1.0, rich_help_panel=P_16S),
+    multi_copy_pick: str = typer.Option("random", "--multi-copy-pick", rich_help_panel=P_16S,
+                                        help="16S kept for genomes with divergent copies: random (wiki) or longest."),
+    max_16s_copies: int = typer.Option(10, "--max-16s-copies", min=1, rich_help_panel=P_16S),
 
-    checkm_qa: Path | None = typer.Option(None, "--checkm-qa", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
-    checkm_qa_bacteria: Path | None = typer.Option(None, "--checkm-qa-bacteria", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
-    checkm_qa_archaea: Path | None = typer.Option(None, "--checkm-qa-archaea", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
-    checkm_results: Path | None = typer.Option(None, "--checkm-results", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
-    completeness_min: float = typer.Option(90.0, "--completeness-min"),
-    contamination_max: float = typer.Option(10.0, "--contamination-max"),
-    place_mode: str = typer.Option("copy", "--place-mode", help="copy|symlink|hardlink"),
-    checkm_bin: str = typer.Option("checkm", "--checkm-bin"),
+    iqtree_bootstrap: int = typer.Option(1000, "--iqtree-bootstrap", min=0, rich_help_panel=P_TREE),
+    iqtree_seed: int = typer.Option(12345, "--iqtree-seed", rich_help_panel=P_TREE),
+    min_genomes: int = typer.Option(4, "--min-genomes", min=4, rich_help_panel=P_TREE,
+                                    help="Minimum genomes needed to build a domain's reference."),
 
-    skip_barrnap: bool = typer.Option(False, "--skip-barrnap", help="Stop after QC."),
-    barrnap_bin: str = typer.Option("barrnap", "--barrnap-bin"),
-    barrnap_reject: float = typer.Option(0.8, "--barrnap-reject", min=0.0, max=1.0),
+    eggnog_existing_dir: Optional[Path] = typer.Option(
+        None, "--eggnog-existing-dir", **DIR_IN, rich_help_panel=P_FUNC,
+        help="Existing <genome>.emapper.annotations files. Without --eggnog-data-dir, MAGs without one are excluded."),
+    eggnog_data_dir: Optional[Path] = typer.Option(None, "--eggnog-data-dir", **DIR_IN, rich_help_panel=P_FUNC,
+                                                   help="eggNOG-mapper data dir; enables running eggNOG-mapper."),
+    eggnog_jobs: int = typer.Option(1, "--eggnog-jobs", min=1, rich_help_panel=P_FUNC),
+    keep_constant_traits: bool = typer.Option(
+        False, "--keep-constant-traits", rich_help_panel=P_FUNC,
+        help="Keep gene families with the same count in every genome (PICRUSt2's default mp method fails on them)."),
 
-    skip_rrna: bool = typer.Option(False, "--skip-rrna", help="Stop after Barrnap."),
-    vsearch_bin: str = typer.Option("vsearch", "--vsearch-bin"),
-    multi_cluster_id: float = typer.Option(0.90, "--multi-cluster-id", min=0.0, max=1.0),
-    final_cluster_id: float = typer.Option(1.0, "--final-cluster-id", min=0.0, max=1.0),
-
-    skip_align: bool = typer.Option(False, "--skip-align", help="Stop after rrna."),
-    cmalign_bin: str = typer.Option("cmalign", "--cmalign-bin"),
-    esl_reformat_bin: str = typer.Option("esl-reformat", "--esl-reformat-bin"),
-    ssu_models_dir: Path = typer.Option(..., "--ssu-models-dir", exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True),
-    cmalign_mxsize_archaea: int = typer.Option(4096, "--cmalign-mxsize-archaea", min=1),
-    cmalign_mxsize_bacteria: int = typer.Option(8192, "--cmalign-mxsize-bacteria", min=1),
-
-    skip_choose_best: bool = typer.Option(False, "--skip-choose-best", help="Stop after align."),
-
-    skip_raxml_check: bool = typer.Option(False, "--skip-raxml-check", help="Stop after choose-best."),
-    raxml_ng_bin: str = typer.Option("raxml-ng", "--raxml-ng-bin"),
-
-    skip_iqtree: bool = typer.Option(False, "--skip-iqtree", help="Stop after raxml-check."),
-    iqtree_bin: str = typer.Option("iqtree", "--iqtree-bin"),
-    iqtree_bootstrap: int = typer.Option(1000, "--iqtree-bootstrap", min=0),
-    iqtree_seed: int = typer.Option(12345, "--iqtree-seed"),
-
-    skip_raxml_evaluate: bool = typer.Option(False, "--skip-raxml-evaluate", help="Stop after IQ-TREE."),
-
-    skip_hmm_prep: bool = typer.Option(False, "--skip-hmm-prep", help="Stop after RAxML-evaluate."),
-
-    skip_hmm_build: bool = typer.Option(False, "--skip-hmm-build", help="Stop after HMM-prep."),
-    hmmbuild_bin: str = typer.Option("hmmbuild", "--hmmbuild-bin"),
-
-    skip_package_ref: bool = typer.Option(False, "--skip-package-ref", help="Stop after HMM-build."),
-
-    skip_ko_table: bool = typer.Option(False, "--skip-ko-table", help="Stop after package-ref."),
-    skip_ec_table: bool = typer.Option(False, "--skip-ec-table", help="Stop after KO table."),
-
-    eggnog_existing_dir: Path | None = typer.Option(
-        None,
-        "--eggnog-existing-dir",
-        exists=True,
-        file_okay=False,
-        dir_okay=True,
-        readable=True,
-        resolve_path=True,
-        help="Directory containing existing eggNOG files named <genome_id>.emapper.annotations.",
-    ),
-    allow_missing_eggnog: bool = typer.Option(
-        False,
-        "--allow-missing-eggnog",
-        help="Allow genomes without matching eggNOG annotations and write zero-filled trait rows.",
-    ),
-
-    force: bool = typer.Option(False, "--force"),
+    gtdbtk_bin: str = typer.Option("gtdbtk", "--gtdbtk-bin", rich_help_panel=P_BIN),
+    checkm_bin: str = typer.Option("checkm", "--checkm-bin", rich_help_panel=P_BIN),
+    barrnap_bin: str = typer.Option("barrnap", "--barrnap-bin", rich_help_panel=P_BIN),
+    vsearch_bin: str = typer.Option("vsearch", "--vsearch-bin", rich_help_panel=P_BIN),
+    ssu_align_bin: str = typer.Option("ssu-align", "--ssu-align-bin", rich_help_panel=P_BIN),
+    esl_reformat_bin: str = typer.Option("esl-reformat", "--esl-reformat-bin", rich_help_panel=P_BIN),
+    raxml_ng_bin: str = typer.Option("raxml-ng", "--raxml-ng-bin", rich_help_panel=P_BIN),
+    iqtree_bin: str = typer.Option("iqtree", "--iqtree-bin", rich_help_panel=P_BIN),
+    hmmbuild_bin: str = typer.Option("hmmbuild", "--hmmbuild-bin", rich_help_panel=P_BIN),
+    emapper_bin: str = typer.Option("emapper.py", "--emapper-bin", rich_help_panel=P_BIN),
 ) -> None:
     """
-    Run MAGPIE workflow through marker-reference packaging, KO table creation, and EC table creation.
+    Run the MAGPIE workflow (or some of its steps) and write OUT/picrust2_db.
+
+    Options that are not given are taken from the previous run in OUT (OUT/magpie_config.json),
+    so a partial run such as `magpie run --out OUT --only iqtree` needs no other options.
     """
-    _validate_checkm_reuse_args(
-        checkm_qa=checkm_qa,
-        checkm_qa_bacteria=checkm_qa_bacteria,
-        checkm_qa_archaea=checkm_qa_archaea,
-        checkm_results=checkm_results,
-    )
-
-    validate_dir = out / "01_validate"
-    prep_dir = out / "02_prep"
-    gtdb_dir = out / "03_gtdbtk"
-    tax_dir = out / "04_taxonomy"
-    qc_dir = out / "05_qc"
-    barrnap_dir = out / "06_barrnap"
-    rrna_dir = out / "07_rrna"
-    align_dir = out / "08_align"
-    choose_best_dir = out / "09_choose_best"
-    raxml_dir = out / "10_raxml_check"
-    iqtree_dir = out / "11_iqtree"
-    raxml_eval_dir = out / "12_raxml_evaluate"
-    hmm_prep_dir = out / "13_hmm_prep"
-    hmm_build_dir = out / "14_hmm_build"
-    package_ref_dir = out / "15_package_ref"
-    ko_table_dir = out / "16_ko_table"
-    ec_table_dir = out / "17_ec_table"
-
-    require_gtdbtk = gtdb_classify is None
-    reuse_provided = (
-        checkm_qa is not None
-        or checkm_qa_bacteria is not None
-        or checkm_qa_archaea is not None
-        or checkm_results is not None
-    )
-    require_checkm = (not skip_qc) and (not reuse_provided)
-
-    _LOGGER.info("Step 1/17: validate -> %s", validate_dir)
-    validate_step(mags=mags, out=validate_dir, force=force, require_gtdbtk=require_gtdbtk, require_checkm=require_checkm)
-
-    _LOGGER.info("Step 2/17: prep -> %s", prep_dir)
-    prep_step(mags=mags, out=prep_dir, rename_map=rename_map, force=force, sequential_ids=sequential_ids, out_prefix=out_prefix, pad=pad)
-
-    _LOGGER.info("Step 3/17: gtdbtk -> %s", gtdb_dir)
-    classify_dir = gtdbtk_step(mags_dir=prep_dir / "mags", out=gtdb_dir, gtdb_classify=gtdb_classify, cpus=cpus, force=force)
-
-    _LOGGER.info("Step 4/17: taxonomy -> %s", tax_dir)
-    taxonomy_step(prep_dir=prep_dir, classify_dir=classify_dir, out=tax_dir, force=force, move_files=move_tax_split)
-
-    if skip_qc:
-        _LOGGER.warning("Skipping QC (--skip-qc).")
-        return
-
-    _LOGGER.info("Step 5/17: qc -> %s", qc_dir)
-    qc_step(
-        tax_dir=tax_dir,
-        out=qc_dir,
-        cpus=cpus,
-        force=force,
-        checkm_qa=checkm_qa,
-        checkm_qa_bacteria=checkm_qa_bacteria,
-        checkm_qa_archaea=checkm_qa_archaea,
-        checkm_results=checkm_results,
-        completeness_min=completeness_min,
-        contamination_max=contamination_max,
-        place_mode=place_mode,
-        checkm_bin=checkm_bin,
-    )
-
-    if skip_barrnap:
-        _LOGGER.warning("Skipping Barrnap (--skip-barrnap).")
-        return
-
-    _LOGGER.info("Step 6/17: barrnap -> %s", barrnap_dir)
-    barrnap_step(qc_dir=qc_dir, out=barrnap_dir, cpus=cpus, force=force, barrnap_bin=barrnap_bin, reject=barrnap_reject)
-
-    if skip_rrna:
-        _LOGGER.warning("Skipping rrna (--skip-rrna).")
-        return
-
-    _LOGGER.info("Step 7/17: rrna -> %s", rrna_dir)
-    rrna_step(
-        barrnap_dir=barrnap_dir,
-        out=rrna_dir,
-        cpus=cpus,
-        force=force,
-        vsearch_bin=vsearch_bin,
-        multi_cluster_id=multi_cluster_id,
-        final_cluster_id=final_cluster_id,
-    )
-
-    if skip_align:
-        _LOGGER.warning("Skipping align (--skip-align).")
-        return
-
-    _LOGGER.info("Step 8/17: align -> %s", align_dir)
-    align_step(
-        rrna_dir=rrna_dir,
-        out=align_dir,
-        cpus=cpus,
-        force=force,
-        cmalign_bin=cmalign_bin,
-        esl_reformat_bin=esl_reformat_bin,
-        ssu_models_dir=ssu_models_dir,
-        mxsize_archaea=cmalign_mxsize_archaea,
-        mxsize_bacteria=cmalign_mxsize_bacteria,
-    )
-
-    if skip_choose_best:
-        _LOGGER.warning("Skipping choose-best (--skip-choose-best).")
-        return
-
-    _LOGGER.info("Step 9/17: choose-best -> %s", choose_best_dir)
-    choose_best_step(prep_dir=prep_dir, qc_dir=qc_dir, rrna_dir=rrna_dir, align_dir=align_dir, out=choose_best_dir, force=force)
-
-    if skip_raxml_check:
-        _LOGGER.warning("Skipping raxml-check (--skip-raxml-check).")
-        return
-
-    _LOGGER.info("Step 10/17: raxml-check -> %s", raxml_dir)
-    raxml_check_step(choose_best_dir=choose_best_dir, out=raxml_dir, raxml_ng_bin=raxml_ng_bin, threads=cpus, force=force)
-
-    if skip_iqtree:
-        _LOGGER.warning("Skipping iqtree (--skip-iqtree).")
-        return
-
-    _LOGGER.info("Step 11/17: iqtree -> %s", iqtree_dir)
-    iqtree_step(raxml_check_dir=raxml_dir, out=iqtree_dir, iqtree_bin=iqtree_bin, threads=cpus, bootstrap=iqtree_bootstrap, seed=iqtree_seed, force=force)
-
-    if skip_raxml_evaluate:
-        _LOGGER.warning("Skipping raxml-evaluate (--skip-raxml-evaluate).")
-        return
-
-    _LOGGER.info("Step 12/17: raxml-evaluate -> %s", raxml_eval_dir)
-    raxml_evaluate_step(raxml_check_dir=raxml_dir, iqtree_dir=iqtree_dir, out=raxml_eval_dir, raxml_ng_bin=raxml_ng_bin, threads=cpus, force=force)
-
-    if skip_hmm_prep:
-        _LOGGER.warning("Skipping hmm-prep (--skip-hmm-prep).")
-        return
-
-    _LOGGER.info("Step 13/17: hmm-prep -> %s", hmm_prep_dir)
-    hmm_prep_step(raxml_check_dir=raxml_dir, out=hmm_prep_dir, esl_reformat_bin=esl_reformat_bin, force=force)
-
-    if skip_hmm_build:
-        _LOGGER.warning("Skipping hmm-build (--skip-hmm-build).")
-        return
-
-    _LOGGER.info("Step 14/17: hmm-build -> %s", hmm_build_dir)
-    hmm_build_step(hmm_prep_dir=hmm_prep_dir, out=hmm_build_dir, hmmbuild_bin=hmmbuild_bin, cpus=cpus, force=force)
-
-    if skip_package_ref:
-        _LOGGER.warning("Skipping package-ref (--skip-package-ref).")
-        return
-
-    _LOGGER.info("Step 15/17: package-ref -> %s", package_ref_dir)
-    package_ref_step(
-        rrna_dir=rrna_dir,
-        iqtree_dir=iqtree_dir,
-        raxml_evaluate_dir=raxml_eval_dir,
-        hmm_prep_dir=hmm_prep_dir,
-        hmm_build_dir=hmm_build_dir,
-        out=package_ref_dir,
-        force=force,
-    )
-
-    if skip_ko_table:
-        _LOGGER.warning("Skipping ko-table (--skip-ko-table).")
-        return
-
-    if eggnog_existing_dir is None:
-        raise typer.BadParameter("To build KO/EC tables, provide --eggnog-existing-dir or use --skip-ko-table.")
-
-    _LOGGER.info("Step 16/17: ko-table -> %s", ko_table_dir)
-    ko_table_step(
-        package_ref_dir=package_ref_dir,
-        eggnog_existing_dir=eggnog_existing_dir,
-        out=ko_table_dir,
-        force=force,
-        allow_missing_eggnog=allow_missing_eggnog,
-    )
-
-    if skip_ec_table:
-        _LOGGER.warning("Skipping ec-table (--skip-ec-table).")
-        return
-
-    _LOGGER.info("Step 17/17: ec-table -> %s", ec_table_dir)
-    ec_table_step(
-        package_ref_dir=package_ref_dir,
-        eggnog_existing_dir=eggnog_existing_dir,
-        out=ec_table_dir,
-        force=force,
-        allow_missing_eggnog=allow_missing_eggnog,
-    )
-
-    _LOGGER.info("MAGPIE run complete.")
+    params = dict(ctx.params)
+    for k in ("only", "start", "stop", "force", "reset_options"):
+        params.pop(k)
+    saved = {} if reset_options else load_saved_config(out)
+    for name, value in saved.items():
+        if name in params and _is_default(ctx, name) and value is not None:
+            params[name] = value
+    for name in _PATH_OPTIONS:
+        if params.get(name) is not None:
+            params[name] = Path(params[name])
+    cfg = Config(force=force, **params)
+    _run_or_exit(lambda: run_pipeline(cfg, only=_steps_option(only), start=start, stop=stop))
 
 
-@app.command("ko-table")
-def cmd_ko_table(
-    package_ref_dir: Path = typer.Option(..., "--package-ref-dir", exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True),
-    eggnog_existing_dir: Path = typer.Option(..., "--eggnog-existing-dir", exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True),
-    out: Path = typer.Option(..., "--out", file_okay=False, dir_okay=True, resolve_path=True),
-    allow_missing_eggnog: bool = typer.Option(False, "--allow-missing-eggnog"),
-    force: bool = typer.Option(False, "--force"),
-) -> None:
-    """Build PICRUSt2-style ko.txt.gz tables from existing eggNOG annotations."""
-    ko_table_step(
-        package_ref_dir=package_ref_dir,
-        eggnog_existing_dir=eggnog_existing_dir,
-        out=out,
-        force=force,
-        allow_missing_eggnog=allow_missing_eggnog,
-    )
+def _is_default(ctx: typer.Context, name: str) -> bool:
+    source = ctx.get_parameter_source(name)
+    return source is None or getattr(source, "name", "") == "DEFAULT"
 
 
-@app.command("ec-table")
-def cmd_ec_table(
-    package_ref_dir: Path = typer.Option(..., "--package-ref-dir", exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True),
-    eggnog_existing_dir: Path = typer.Option(..., "--eggnog-existing-dir", exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True),
-    out: Path = typer.Option(..., "--out", file_okay=False, dir_okay=True, resolve_path=True),
-    allow_missing_eggnog: bool = typer.Option(False, "--allow-missing-eggnog"),
-    force: bool = typer.Option(False, "--force"),
-) -> None:
-    """Build PICRUSt2-style ec.txt.gz tables from existing eggNOG annotations."""
-    ec_table_step(
-        package_ref_dir=package_ref_dir,
-        eggnog_existing_dir=eggnog_existing_dir,
-        out=out,
-        force=force,
-        allow_missing_eggnog=allow_missing_eggnog,
-    )
+_PATH_OPTIONS = {"out", "mags", "rename_map", "gtdb_classify", "checkm_qa", "checkm_qa_bacteria", "checkm_qa_archaea",
+                 "eggnog_existing_dir", "eggnog_data_dir"}
+
+
+@app.command("steps")
+def cmd_steps() -> None:
+    """List the workflow steps (names for --only / --from / --to)."""
+    for name in STEP_NAMES:
+        typer.echo(f"{STEP_DIRS[name]:18s} {name}")
+
+
+@app.command("status")
+def cmd_status(out: Path = typer.Option(..., "--out", **DIR_IN)) -> None:
+    """Show which steps are done in an output directory."""
+    for dirname, name, state in status(out):
+        typer.echo(f"{dirname:18s} {name:15s} {state}")
+
+
+@app.command("check-db")
+def cmd_check_db(db: Path = typer.Option(..., "--db", **DIR_IN, help="A MAGPIE picrust2_db directory.")) -> None:
+    """Check that FASTA, tree, HMM, 16S copies and trait tables of a database agree."""
+    from .steps.picrust2_db import check_db
+
+    problems = check_db(db)
+    if problems:
+        typer.echo("\n".join(problems), err=True)
+        raise typer.Exit(1)
+    typer.echo(f"OK: {db}")
+
 
 @app.command("install-picrust2-ref")
 def cmd_install_picrust2_ref(
-    package_ref_dir: Path = typer.Option(
-        ...,
-        "--package-ref-dir",
-        exists=True,
-        file_okay=False,
-        dir_okay=True,
-        readable=True,
-        resolve_path=True,
-        help="MAGPIE package-ref output directory, e.g. out/15_package_ref.",
-    ),
-    picrust2_env: Path = typer.Option(
-        ...,
-        "--picrust2-env",
-        exists=True,
-        file_okay=False,
-        dir_okay=True,
-        readable=True,
-        resolve_path=True,
-        help="Path to the PICRUSt2 conda environment whose default files should be replaced.",
-    ),
-    out: Path = typer.Option(
-        ...,
-        "--out",
-        file_okay=False,
-        dir_okay=True,
-        resolve_path=True,
-        help="Output directory for install manifest and optional backups.",
-    ),
-    backup: bool = typer.Option(
-        True,
-        "--backup/--no-backup",
-        help="Back up existing PICRUSt2 default files before replacing them.",
-    ),
-    force: bool = typer.Option(
-        False,
-        "--force",
-        help="Overwrite existing PICRUSt2 default files.",
-    ),
+    db: Path = typer.Option(..., "--db", "--package-ref-dir", **DIR_IN, help="MAGPIE output OUT/picrust2_db."),
+    picrust2_env: Path = typer.Option(..., "--picrust2-env", **DIR_IN,
+                                      help="PICRUSt2 conda environment whose default files are replaced."),
+    out: Path = typer.Option(..., "--out", file_okay=False, resolve_path=True,
+                             help="Directory for the install manifest and the backup of the replaced files."),
+    backup: bool = typer.Option(True, "--backup/--no-backup"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Only report what would be changed."),
 ) -> None:
-    """
-    Install MAGPIE-produced PICRUSt2 reference files into a selected PICRUSt2 conda environment.
-    """
-    install_picrust2_ref_step(
-        package_ref_dir=package_ref_dir,
-        picrust2_env=picrust2_env,
-        out=out,
-        force=force,
-        backup=backup,
-    )
+    """Install a MAGPIE database as the default reference of a PICRUSt2 (v2.6+) environment."""
+    from .steps.install_picrust2_ref import install_picrust2_ref_step
+
+    _run_or_exit(lambda: install_picrust2_ref_step(db=db, picrust2_env=picrust2_env, out=out, backup=backup,
+                                                   dry_run=dry_run))
+
 
 if __name__ == "__main__":
     app()

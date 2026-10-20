@@ -1,498 +1,173 @@
+"""
+Genome quality filter (scripts 04_quality_control.sh, 04b_extract.sh, 05_quality_filtering.py;
+wiki: "Filter to include only genomes >90% completion and <10% redundancy").
+
+CheckM values are either computed here (checkm lineage_wf + checkm qa, per domain as in script 04)
+or read from existing CheckM output (--checkm-qa, or --checkm-qa-bacteria/--checkm-qa-archaea).
+Accepted formats: `checkm qa -o 2` fixed-width tables, tab-separated QA tables (--tab_table or the
+merged table of script 04b) and minimal 3-column tables (genome_id, checkm_completeness,
+checkm_contamination). Genome names may be MAGPIE IDs, original file names or stems.
+
+The domain of each genome comes from the GTDB-Tk-based taxonomy step. When eggNOG annotations are
+only reused (--eggnog-existing-dir without --eggnog-data-dir), genomes without an annotation are
+excluded here, so that every reference genome has functional traits.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-import csv
 import gzip
-import json
+import logging
 import re
 import shutil
-from typing import Dict, Iterable, List, Optional, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
 
-from magpie.util.shell import run as shell_run
+from ..pipeline import MagpieError
+from ..util.ids import IdLookup
+from ..util.io import ensure_dir, open_text, write_id_list, write_json, write_tsv
+from ..util.shell import run_cmd
 
+_LOGGER = logging.getLogger("magpie.qc")
 
-SEP_RE = re.compile(r"^\s*-{5,}\s*$")
-SPLIT_RE = re.compile(r"\s{2,}")  # CheckM QA tables align with >=2 spaces
-FASTA_EXTS = (".fa", ".fna", ".fasta")
-GZ_EXT = ".gz"
+_SEP_RE = re.compile(r"^\s*-{5,}\s*$")
+_SPACES_RE = re.compile(r"\s{2,}")
 
 
 @dataclass(frozen=True)
 class CheckMRow:
-    genome_id: str
+    name: str
     marker_lineage: str
     completeness: float
     contamination: float
 
 
-def _ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+def _col(cols: List[str], *names: str) -> Optional[int]:
+    low = [c.strip().lower() for c in cols]
+    for n in names:
+        if n in low:
+            return low.index(n)
+    return None
 
 
-def _strip_fasta_suffix(name: str) -> str:
-    s = name.strip()
-    if s.lower().endswith(GZ_EXT):
-        s = s[:-len(GZ_EXT)]
-    for ext in FASTA_EXTS:
-        if s.lower().endswith(ext):
-            s = s[:-len(ext)]
-            break
-    return s
-
-
-def _iter_genome_files(dir_: Path) -> Iterable[Path]:
-    for p in dir_.iterdir():
-        if not p.is_file():
-            continue
-        low = p.name.lower()
-        if any(low.endswith(ext) for ext in FASTA_EXTS) or any(low.endswith(ext + GZ_EXT) for ext in FASTA_EXTS):
-            yield p
-
-
-def _read_domain_map(domain_map_tsv: Path) -> Dict[str, str]:
-    """
-    domain_map.tsv written by taxonomy step.
-    Expected columns: genome_id \t domain
-    """
-    domain_by_id: Dict[str, str] = {}
-    with domain_map_tsv.open("r", newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh, delimiter="\t")
-        fields = reader.fieldnames or []
-        genome_key = "genome_id" if "genome_id" in fields else ("Genome" if "Genome" in fields else None)
-        domain_key = "domain" if "domain" in fields else ("Domain" if "Domain" in fields else None)
-
-        if genome_key is None or domain_key is None:
-            raise ValueError(f"domain_map.tsv missing expected columns. Found: {fields}")
-
-        for row in reader:
-            gid = (row.get(genome_key) or "").strip()
-            dom = (row.get(domain_key) or "").strip()
-            if gid:
-                domain_by_id[gid] = dom
-    return domain_by_id
-
-
-def parse_checkm_qa_table(tsv_like: Path) -> List[CheckMRow]:
-    """
-    Parse CheckM QA (-o 2) wide table (space-aligned).
-    Works with the style:
-    Bin Id, Marker lineage, ..., Completeness, Contamination, ...
-    """
-    header_cols: Optional[List[str]] = None
-    idx_comp = idx_cont = None
-    rows: List[CheckMRow] = []
-
-    with tsv_like.open("r", encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
-            line = raw.rstrip("\n")
-            s = line.strip()
-            if not s:
-                continue
-            if SEP_RE.match(s):
-                continue
-
-            if s.startswith("Bin Id"):
-                header_cols = SPLIT_RE.split(s)
-                try:
-                    idx_comp = header_cols.index("Completeness")
-                    idx_cont = header_cols.index("Contamination")
-                except ValueError as e:
-                    raise ValueError(f"Could not locate Completeness/Contamination in header: {header_cols}") from e
-                continue
-
-            if header_cols is None or idx_comp is None or idx_cont is None:
-                continue
-
-            parts = SPLIT_RE.split(s)
-            if len(parts) <= max(idx_comp, idx_cont):
-                continue
-
-            genome_id = parts[0].strip()
-            marker_lineage = parts[1].strip() if len(parts) > 1 else ""
-
-            try:
-                completeness = float(parts[idx_comp])
-                contamination = float(parts[idx_cont])
-            except ValueError:
-                continue
-
-            rows.append(
-                CheckMRow(
-                    genome_id=genome_id,
-                    marker_lineage=marker_lineage,
-                    completeness=completeness,
-                    contamination=contamination,
-                )
-            )
-
-    seen = set()
-    dedup: List[CheckMRow] = []
-    for r in rows:
-        if r.genome_id in seen:
-            continue
-        seen.add(r.genome_id)
-        dedup.append(r)
-
-    if not dedup:
-        raise ValueError(f"No rows parsed from CheckM QA table: {tsv_like}")
-
-    return dedup
-
-
-def parse_legacy_minimal_tsv(path: Path) -> List[CheckMRow]:
-    """
-    Legacy minimal TSV with columns:
-      genome_id, checkm_completeness, checkm_contamination
-    """
-    out: List[CheckMRow] = []
-    with path.open("r", newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh, delimiter="\t")
-        fields = reader.fieldnames or []
-
-        gid_key = "genome_id" if "genome_id" in fields else None
-        c_key = "checkm_completeness" if "checkm_completeness" in fields else None
-        t_key = "checkm_contamination" if "checkm_contamination" in fields else None
-
-        if not (gid_key and c_key and t_key):
-            raise ValueError(f"Legacy CheckM results TSV missing required columns. Found: {fields}")
-
-        for row in reader:
-            gid = (row.get(gid_key) or "").strip()
-            if not gid:
-                continue
-            try:
-                cpl = float((row.get(c_key) or "").strip())
-                cnt = float((row.get(t_key) or "").strip())
-            except ValueError:
-                continue
-
-            out.append(
-                CheckMRow(
-                    genome_id=gid,
-                    marker_lineage="",
-                    completeness=cpl,
-                    contamination=cnt,
-                )
-            )
-
-    seen = set()
-    dedup: List[CheckMRow] = []
-    for r in out:
-        if r.genome_id in seen:
-            continue
-        seen.add(r.genome_id)
-        dedup.append(r)
-
-    if not dedup:
-        raise ValueError(f"No rows parsed from legacy CheckM TSV: {path}")
-
-    return dedup
-
-
-def write_tsv(path: Path, header: List[str], rows: Iterable[List[str]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh, delimiter="\t")
-        w.writerow(header)
-        for r in rows:
-            w.writerow(r)
-
-
-def place_bins(
-    kept_ids: List[str],
-    src_dir: Path,
-    dst_dir: Path,
-    mode: str = "symlink",
-) -> Tuple[int, List[str]]:
-    """
-    Place genomes by exact filename-stem match inside src_dir.
-    """
-    dst_dir.mkdir(parents=True, exist_ok=True)
-
-    index: Dict[str, Path] = {}
-    for p in _iter_genome_files(src_dir):
-        gid = _strip_fasta_suffix(p.name)
-        if gid in index:
-            raise ValueError(f"Ambiguous genome_id '{gid}' in {src_dir}: {index[gid].name} and {p.name}")
-        index[gid] = p
-
-    placed = 0
-    missing: List[str] = []
-
-    for gid in kept_ids:
-        src = index.get(gid)
-        if src is None:
-            missing.append(gid)
-            continue
-
-        dst = dst_dir / src.name
-        if dst.exists():
-            continue
-
-        try:
-            if mode == "symlink":
-                dst.symlink_to(src)
-            elif mode == "hardlink":
-                dst.hardlink_to(src)
-            elif mode == "copy":
-                shutil.copy2(src, dst)
-            else:
-                raise ValueError(f"Unknown placement mode: {mode}")
-        except OSError:
-            if mode in ("symlink", "hardlink"):
-                shutil.copy2(src, dst)
-            else:
-                raise
-
-        placed += 1
-
-    return placed, missing
-
-
-def _gunzip_or_copy_dir(src: Path, dst: Path) -> None:
-    _ensure_dir(dst)
-    any_seen = False
-
-    for p in _iter_genome_files(src):
-        any_seen = True
-        if p.name.lower().endswith(GZ_EXT):
-            out_fp = dst / p.name[:-len(GZ_EXT)]
-            with gzip.open(p, "rb") as fin, out_fp.open("wb") as fout:
-                shutil.copyfileobj(fin, fout)
-        else:
-            shutil.copy2(p, dst / p.name)
-
-    if not any_seen:
-        raise ValueError(f"No FASTA files found in: {src}")
-
-
-def _run_checkm(
-    *,
-    bacteria_dir: Path,
-    archaea_dir: Path,
-    out: Path,
-    cpus: int,
-    checkm_bin: str,
-) -> Tuple[Optional[Path], Optional[Path]]:
-    """
-    Run CheckM on taxonomy-split genomes and return QA file paths.
-    """
-    checkm_root = out / "checkm_run"
-    work_bac = checkm_root / "unzipped" / "bacteria"
-    work_arc = checkm_root / "unzipped" / "archaea"
-    _ensure_dir(work_bac)
-    _ensure_dir(work_arc)
-
-    qa_bac: Optional[Path] = None
-    qa_arc: Optional[Path] = None
-
-    bac_files = list(_iter_genome_files(bacteria_dir)) if bacteria_dir.exists() else []
-    arc_files = list(_iter_genome_files(archaea_dir)) if archaea_dir.exists() else []
-
-    if bac_files:
-        _gunzip_or_copy_dir(bacteria_dir, work_bac)
-        out_bac = checkm_root / "bacteria"
-        _ensure_dir(out_bac)
-        ext = "fna" if list(work_bac.glob("*.fna")) else "fa"
-        shell_run([checkm_bin, "lineage_wf", "-x", ext, "-t", str(cpus), str(work_bac), str(out_bac)])
-        qa_bac = out_bac / "checkm_qa.tsv"
-        shell_run([checkm_bin, "qa", str(out_bac / "lineage.ms"), str(out_bac), "-o", "2", "-f", str(qa_bac)])
-
-    if arc_files:
-        _gunzip_or_copy_dir(archaea_dir, work_arc)
-        out_arc = checkm_root / "archaea"
-        _ensure_dir(out_arc)
-        ext = "fna" if list(work_arc.glob("*.fna")) else "fa"
-        shell_run([checkm_bin, "lineage_wf", "-x", ext, "-t", str(cpus), str(work_arc), str(out_arc)])
-        qa_arc = out_arc / "checkm_qa.tsv"
-        shell_run([checkm_bin, "qa", str(out_arc / "lineage.ms"), str(out_arc), "-o", "2", "-f", str(qa_arc)])
-
-    if qa_bac is None and qa_arc is None:
-        raise ValueError("No genomes found in bacteria/archaea dirs; cannot run CheckM.")
-
-    return qa_bac, qa_arc
-
-def _resolve_split_dirs(tax_dir: Path) -> Tuple[Path, Path]:
-    """
-    Resolve taxonomy split genome directories using a small set of explicit layouts.
-    No fuzzy searching.
-    """
-    candidates = [
-        (tax_dir / "bacteria", tax_dir / "archaea"),
-        (tax_dir / "split" / "bacteria", tax_dir / "split" / "archaea"),
-        (tax_dir / "genomes" / "bacteria", tax_dir / "genomes" / "archaea"),
-        (tax_dir / "genomes_to_search_barrnap" / "bacteria", tax_dir / "genomes_to_search_barrnap" / "archaea"),
-    ]
-
-    for bac, arc in candidates:
-        if bac.exists() and arc.exists():
-            return bac, arc
-
-    checked = "\n".join(
-        f"  - {bac}\n  - {arc}"
-        for bac, arc in candidates
-    )
-    raise FileNotFoundError(
-        "Could not find taxonomy split genome directories. Checked:\n"
-        f"{checked}"
-    )
-
-def qc_step(
-    *,
-    tax_dir: Path,
-    out: Path,
-    cpus: int,
-    force: bool,
-    checkm_qa: Path | None,
-    checkm_qa_bacteria: Path | None,
-    checkm_qa_archaea: Path | None,
-    checkm_results: Path | None,
-    completeness_min: float,
-    contamination_max: float,
-    place_mode: str,
-    checkm_bin: str,
-) -> None:
-    """
-    QC step used by MAGPIE CLI.
-    Expected taxonomy outputs under tax_dir:
-      - domain_map.tsv
-      - bacteria/archaea OR split/bacteria/archaea OR similar explicit layouts
-    """
-    out.mkdir(parents=True, exist_ok=True)
-
-    out_all = out / "checkm_clean_all.tsv"
-    out_filt = out / "checkm_filtered.tsv"
-    if (out_all.exists() or out_filt.exists()) and not force:
-        raise FileExistsError(f"QC outputs exist under {out}. Use --force to overwrite.")
-
-    domain_map = tax_dir / "domain_map.tsv"
-    bacteria_dir, archaea_dir = _resolve_split_dirs(tax_dir)
-
-    domain_by_id = _read_domain_map(domain_map)
-
-    merged_rows: List[CheckMRow] = []
-
-    if checkm_results is not None:
-        merged_rows.extend(parse_legacy_minimal_tsv(checkm_results))
-    elif checkm_qa is not None:
-        merged_rows.extend(parse_checkm_qa_table(checkm_qa))
-    elif checkm_qa_bacteria is not None or checkm_qa_archaea is not None:
-        if checkm_qa_bacteria is not None:
-            merged_rows.extend(parse_checkm_qa_table(checkm_qa_bacteria))
-        if checkm_qa_archaea is not None:
-            merged_rows.extend(parse_checkm_qa_table(checkm_qa_archaea))
+def parse_checkm_table(path: Path) -> List[CheckMRow]:
+    """Parse CheckM QA output in any of the formats used by the MAGPIE scripts."""
+    with open_text(path) as fh:
+        lines = [ln.rstrip("\n") for ln in fh if ln.strip() and not _SEP_RE.match(ln)]
+    if not lines:
+        raise MagpieError(f"CheckM table is empty: {path}")
+    if "\t" in lines[0]:
+        split = lambda s: s.split("\t")  # noqa: E731
     else:
-        qa_bac, qa_arc = _run_checkm(
-            bacteria_dir=bacteria_dir,
-            archaea_dir=archaea_dir,
-            out=out,
-            cpus=cpus,
-            checkm_bin=checkm_bin,
-        )
-        if qa_bac is not None:
-            merged_rows.extend(parse_checkm_qa_table(qa_bac))
-        if qa_arc is not None:
-            merged_rows.extend(parse_checkm_qa_table(qa_arc))
+        split = lambda s: _SPACES_RE.split(s.strip())  # noqa: E731
 
-    seen = set()
-    dedup_rows: List[CheckMRow] = []
-    for r in merged_rows:
-        if r.genome_id in seen:
+    header = split(lines[0])
+    i_id = _col(header, "bin id", "genome_id", "name", "genome", "user_genome")
+    i_comp = _col(header, "completeness", "checkm_completeness")
+    i_cont = _col(header, "contamination", "checkm_contamination")
+    i_lin = _col(header, "marker lineage", "marker_lineage")
+    if None in (i_id, i_comp, i_cont):
+        raise MagpieError(f"No genome ID / Completeness / Contamination columns in {path} (header: {header})")
+
+    rows, seen = [], set()
+    for ln in lines[1:]:
+        parts = split(ln)
+        if len(parts) <= max(i_id, i_comp, i_cont):
             continue
-        seen.add(r.genome_id)
-        dedup_rows.append(r)
-
-    if not dedup_rows:
-        raise ValueError("No CheckM rows available after parsing inputs.")
-
-    merged = []
-    missing_in_domain = []
-    for r in dedup_rows:
-        dom = domain_by_id.get(r.genome_id)
-        if dom is None:
-            missing_in_domain.append(r.genome_id)
+        try:
+            row = CheckMRow(parts[i_id].strip(), parts[i_lin].strip() if i_lin is not None else "",
+                            float(parts[i_comp]), float(parts[i_cont]))
+        except ValueError:
             continue
-        merged.append((r, dom))
+        if row.name not in seen:
+            seen.add(row.name)
+            rows.append(row)
+    if not rows:
+        raise MagpieError(f"No rows could be parsed from CheckM table {path}")
+    return rows
 
-    if missing_in_domain:
-        missing_preview = ", ".join(missing_in_domain[:10])
-        raise ValueError(
-            f"{len(missing_in_domain)} CheckM IDs not present in domain_map.tsv "
-            f"(first 10: {missing_preview}). This usually means an ID mismatch between "
-            f"prepared genomes and CheckM input."
-        )
 
-    write_tsv(
-        out / "checkm_results.min.tsv",
-        header=["genome_id", "checkm_completeness", "checkm_contamination"],
-        rows=[
-            [r.genome_id, f"{r.completeness:.2f}", f"{r.contamination:.2f}"]
-            for (r, _) in merged
-        ],
-    )
+def _run_checkm(*, genome_dirs: Dict[str, Path], out: Path, checkm_bin: str, cpus: int) -> List[Path]:
+    """checkm lineage_wf + qa per domain on unzipped genomes (script 04)."""
+    tables = []
+    for dom, src in genome_dirs.items():
+        files = sorted(src.glob("*.fna.gz"))
+        if not files:
+            continue
+        work = ensure_dir(out / "checkm" / "unzipped" / dom)
+        for f in files:
+            with gzip.open(f, "rb") as fin, (work / f.name[:-3]).open("wb") as fout:
+                shutil.copyfileobj(fin, fout)
+        res = out / "checkm" / dom
+        run_cmd([checkm_bin, "lineage_wf", "-x", "fna", "-t", str(cpus), str(work), str(res)],
+                log_path=out / "checkm" / f"{dom}.log")
+        table = res / "checkm_qa.tsv"
+        run_cmd([checkm_bin, "qa", str(res / "lineage.ms"), str(res), "-o", "2", "--tab_table", "-f", str(table)],
+                log_path=out / "checkm" / f"{dom}.log")
+        shutil.rmtree(work)
+        tables.append(table)
+    return tables
 
-    write_tsv(
-        out_all,
-        header=["genome_id", "marker_lineage", "checkm_completeness", "checkm_contamination", "domain"],
-        rows=[
-            [r.genome_id, r.marker_lineage, f"{r.completeness:.2f}", f"{r.contamination:.2f}", dom]
-            for (r, dom) in merged
-        ],
-    )
 
-    kept = [
-        (r, dom) for (r, dom) in merged
-        if r.completeness >= completeness_min and r.contamination <= contamination_max
-    ]
+def qc_step(*, prep_dir: Path, tax_dir: Path, out: Path, checkm_tables: List[Path], checkm_bin: str, cpus: int,
+            completeness_min: float, contamination_max: float,
+            annotated: Optional[set] = None) -> None:
+    domains = {d: [ln for ln in (tax_dir / f"{d}.txt").read_text().split() if ln] for d in ("bacteria", "archaea")}
+    domain_of = {g: d for d, ids in domains.items() for g in ids}
 
-    write_tsv(
-        out_filt,
-        header=["genome_id", "marker_lineage", "checkm_completeness", "checkm_contamination", "domain"],
-        rows=[
-            [r.genome_id, r.marker_lineage, f"{r.completeness:.2f}", f"{r.contamination:.2f}", dom]
-            for (r, dom) in kept
-        ],
-    )
+    if not checkm_tables:
+        _LOGGER.info("Running CheckM lineage_wf on %d genomes", len(domain_of))
+        checkm_tables = _run_checkm(genome_dirs={d: tax_dir / "genomes_to_search_barrnap" / d for d in domains},
+                                    out=out, checkm_bin=checkm_bin, cpus=cpus)
 
-    bac_ids = sorted({r.genome_id for (r, dom) in kept if dom.lower().startswith("bact")})
-    arc_ids = sorted({r.genome_id for (r, dom) in kept if dom.lower().startswith("arch")})
+    lookup = IdLookup(prep_dir / "id_map.tsv")
+    quality: Dict[str, CheckMRow] = {}
+    n_other = 0
+    for table in checkm_tables:
+        for row in parse_checkm_table(table):
+            gid = lookup.resolve(row.name)
+            if gid is None:
+                n_other += 1
+            else:
+                quality.setdefault(gid, row)
+    if n_other:
+        _LOGGER.info("Ignored %d CheckM rows for genomes that are not among the input MAGs", n_other)
+    missing = sorted(g for g in domain_of if g not in quality)
+    if missing:
+        raise MagpieError(f"{len(missing)} genomes have no CheckM values (e.g. {', '.join(missing[:5])}). "
+                          f"Tables used: {', '.join(map(str, checkm_tables))}")
 
-    (out / "bacteria.txt").write_text("\n".join(bac_ids) + ("\n" if bac_ids else ""), encoding="utf-8")
-    (out / "archaea.txt").write_text("\n".join(arc_ids) + ("\n" if arc_ids else ""), encoding="utf-8")
+    all_rows, kept, no_annotation = [], {"bacteria": [], "archaea": []}, []
+    for gid in sorted(domain_of):
+        q, dom = quality[gid], domain_of[gid]
+        status = "pass"
+        if not (q.completeness >= completeness_min and q.contamination <= contamination_max):
+            status = "fail_quality"
+        elif annotated is not None and gid not in annotated:
+            status = "no_annotation"
+            no_annotation.append(gid)
+        all_rows.append([gid, q.marker_lineage, f"{q.completeness:.2f}", f"{q.contamination:.2f}",
+                         dom.capitalize(), status])
+        if status == "pass":
+            kept[dom].append(gid)
 
-    bins_root = out / "bins"
-    placed_bac, miss_bac = place_bins(bac_ids, bacteria_dir, bins_root / "bacteria", mode=place_mode)
-    placed_arc, miss_arc = place_bins(arc_ids, archaea_dir, bins_root / "archaea", mode=place_mode)
+    header = ["genome_id", "marker_lineage", "checkm_completeness", "checkm_contamination", "domain"]
+    write_tsv(out / "checkm_clean_all.tsv", header + ["status"], all_rows)
+    write_tsv(out / "checkm_filtered.tsv", header, [r[:5] for r in all_rows if r[5] == "pass"])
+    for dom, ids in kept.items():
+        write_id_list(out / f"{dom}.txt", ids)
+        bins = ensure_dir(out / "bins" / dom)
+        for gid in ids:
+            (bins / f"{gid}_genomic.fna.gz").symlink_to((prep_dir / "mags" / f"{gid}_genomic.fna.gz").resolve())
 
-    report = {
-        "inputs": {
-            "tax_dir": str(tax_dir),
-            "domain_map": str(domain_map),
-            "bacteria_dir": str(bacteria_dir),
-            "archaea_dir": str(archaea_dir),
-            "checkm_qa": str(checkm_qa) if checkm_qa is not None else None,
-            "checkm_qa_bacteria": str(checkm_qa_bacteria) if checkm_qa_bacteria is not None else None,
-            "checkm_qa_archaea": str(checkm_qa_archaea) if checkm_qa_archaea is not None else None,
-            "checkm_results": str(checkm_results) if checkm_results is not None else None,
-        },
-        "thresholds": {
-            "completeness_min": completeness_min,
-            "contamination_max": contamination_max,
-        },
-        "kept": {
-            "bacteria": len(bac_ids),
-            "archaea": len(arc_ids),
-            "total": len(kept),
-        },
-        "placed": {
-            "bacteria": placed_bac,
-            "archaea": placed_arc,
-        },
-        "missing_files": {
-            "bacteria": miss_bac[:20],
-            "archaea": miss_arc[:20],
-        },
-        "placement_mode": place_mode,
-    }
-    (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    n_fail = sum(1 for r in all_rows if r[5] == "fail_quality")
+    _LOGGER.info("QC: %d bacteria and %d archaea pass (completeness >= %g, contamination <= %g); %d fail",
+                 len(kept["bacteria"]), len(kept["archaea"]), completeness_min, contamination_max, n_fail)
+    if no_annotation:
+        _LOGGER.warning("%d genomes passed QC but have no eggNOG annotation and are excluded (e.g. %s)",
+                        len(no_annotation), ", ".join(no_annotation[:5]))
+    write_json(out / "report.json", {"checkm_tables": [str(t) for t in checkm_tables],
+                                     "completeness_min": completeness_min, "contamination_max": contamination_max,
+                                     "kept": {d: len(v) for d, v in kept.items()}, "failed_quality": n_fail,
+                                     "excluded_no_annotation": no_annotation})
+    if not any(kept.values()):
+        raise MagpieError("No genomes passed quality control")

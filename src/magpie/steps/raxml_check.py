@@ -1,256 +1,60 @@
+"""
+raxml-ng --check (script 14; wiki: "Run the raxml check"):
+
+  raxml-ng --check --msa <domain>_16S_centroids_ssu_align_best.fna --model GTR+G
+           --prefix <domain>_raxml-check --threads N
+
+RAxML-NG writes <prefix>.raxml.reduced.phy when it removes identical sequences or gap-only
+columns. As in the wiki and script 14, the archaeal alignment is always converted to PHYLIP as-is
+("Convert archaea alignment to phylip so we have the same for both"), replacing any reduced file;
+for bacteria the reduced file is used, or the alignment is converted if RAxML-NG wrote none.
+Domains with fewer than --min-genomes sequences are skipped (RAxML-NG/IQ-TREE need >= 4).
+"""
 from __future__ import annotations
 
-import csv
-import json
 import logging
-import subprocess
 from pathlib import Path
-from typing import Dict, List, Tuple
+
+from ..util.io import read_fasta, read_phylip, write_json, write_phylip
+from ..util.shell import run_cmd
 
 _LOGGER = logging.getLogger("magpie.raxml_check")
 
 
-def _ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+def raxml_check_step(*, choose_best_dir: Path, out: Path, raxml_ng_bin: str, threads: int, min_genomes: int) -> None:
+    report = {}
+    for domain in ("bacteria", "archaea"):
+        msa = choose_best_dir / f"{domain}_16S_centroids_ssu_align_best.fna"
+        if not msa.exists():
+            report[domain] = {"status": "no_input"}
+            continue
+        records = [(h.split()[0], s) for h, s in read_fasta(msa)]
+        if len(records) < min_genomes:
+            _LOGGER.warning("%s: only %d genomes with a unique 16S gene; at least %d are needed, so no %s "
+                            "reference is built (PICRUSt2's default one can be used instead)",
+                            domain, len(records), min_genomes, domain)
+            report[domain] = {"status": "too_few_genomes", "n": len(records)}
+            continue
 
-
-def _has_fasta_records(path: Path) -> bool:
-    if not path.exists():
-        return False
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
-            if raw.startswith(">"):
-                return True
-    return False
-
-
-def _read_fasta(path: Path) -> List[Tuple[str, str]]:
-    records: List[Tuple[str, str]] = []
-    header: str | None = None
-    seq_parts: List[str] = []
-
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line:
-                continue
-            if line.startswith(">"):
-                if header is not None:
-                    records.append((header, "".join(seq_parts)))
-                header = line[1:].strip().split()[0]
-                seq_parts = []
-            else:
-                if header is None:
-                    raise ValueError(f"Malformed FASTA without header in {path}")
-                seq_parts.append(line)
-
-    if header is not None:
-        records.append((header, "".join(seq_parts)))
-
-    return records
-
-
-def _write_relaxed_phylip(records: List[Tuple[str, str]], out_path: Path) -> None:
-    if not records:
-        out_path.write_text("", encoding="utf-8")
-        return
-
-    lengths = {len(seq) for _, seq in records}
-    if len(lengths) != 1:
-        raise ValueError(
-            f"Cannot write PHYLIP: sequences have unequal lengths in alignment for {out_path}"
-        )
-
-    aln_len = next(iter(lengths))
-
-    with out_path.open("w", encoding="utf-8") as f:
-        f.write(f"{len(records)} {aln_len}\n")
-        for rec_id, seq in records:
-            f.write(f"{rec_id} {seq}\n")
-
-
-def _run_command(cmd: list[str]) -> None:
-    _LOGGER.debug("Running command: %s", " ".join(cmd))
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"Command failed:\n"
-            f"  {' '.join(cmd)}\n"
-            f"stdout:\n{proc.stdout}\n"
-            f"stderr:\n{proc.stderr}"
-        )
-
-
-def _run_raxml_check(
-    *,
-    msa: Path,
-    prefix: Path,
-    raxml_ng_bin: str,
-    threads: int,
-) -> None:
-    cmd = [
-        raxml_ng_bin,
-        "--check",
-        "--msa",
-        str(msa),
-        "--model",
-        "GTR+G",
-        "--prefix",
-        str(prefix),
-        "--threads",
-        str(threads),
-    ]
-    _run_command(cmd)
-
-
-def _check_one_domain(
-    *,
-    domain: str,
-    msa_fasta: Path,
-    out_dir: Path,
-    raxml_ng_bin: str,
-    threads: int,
-) -> Dict[str, object]:
-    prefix = out_dir / f"{domain}_raxml-check"
-    reduced_phy = out_dir / f"{domain}_raxml-check.raxml.reduced.phy"
-    log_path = out_dir / f"{domain}_raxml-check.raxml.log"
-
-    if not _has_fasta_records(msa_fasta):
-        _LOGGER.warning("Skipping %s raxml-check: no sequences found in %s", domain, msa_fasta)
-        return {
-            "domain": domain,
-            "status": "skipped_empty_input",
-            "msa_fasta": str(msa_fasta),
-            "prefix": str(prefix),
-            "reduced_phy": str(reduced_phy),
-            "log_path": str(log_path),
-            "n_sequences": 0,
-            "alignment_length": 0,
-            "phy_source": "none",
-        }
-
-    records = _read_fasta(msa_fasta)
-    lengths = {len(seq) for _, seq in records}
-    if len(lengths) != 1:
-        raise ValueError(f"Alignment for {domain} has unequal sequence lengths: {msa_fasta}")
-    aln_len = next(iter(lengths))
-
-    _LOGGER.info("Running raxml-ng --check for %s", domain)
-    _run_raxml_check(
-        msa=msa_fasta,
-        prefix=prefix,
-        raxml_ng_bin=raxml_ng_bin,
-        threads=threads,
-    )
-
-    phy_source = "raxml_reduced"
-    if not reduced_phy.exists():
-        _LOGGER.warning(
-            "RAxML-NG did not produce reduced PHYLIP for %s; writing PHYLIP directly from aligned FASTA.",
-            domain,
-        )
-        _write_relaxed_phylip(records, reduced_phy)
-        phy_source = "manual_from_fasta"
-
-    return {
-        "domain": domain,
-        "status": "processed",
-        "msa_fasta": str(msa_fasta),
-        "prefix": str(prefix),
-        "reduced_phy": str(reduced_phy),
-        "log_path": str(log_path),
-        "n_sequences": len(records),
-        "alignment_length": aln_len,
-        "phy_source": phy_source,
-    }
-
-
-def raxml_check_step(
-    *,
-    choose_best_dir: Path,
-    out: Path,
-    raxml_ng_bin: str,
-    threads: int,
-    force: bool,
-) -> None:
-    """
-    Run raxml-ng --check on the best aligned 16S FASTAs and ensure a PHYLIP output exists.
-
-    Inputs:
-      choose_best_dir/archaea/archaea_16S_centroids_ssu_align_best.fna
-      choose_best_dir/bacteria/bacteria_16S_centroids_ssu_align_best.fna
-    """
-    arch_msa = choose_best_dir / "archaea" / "archaea_16S_centroids_ssu_align_best.fna"
-    bact_msa = choose_best_dir / "bacteria" / "bacteria_16S_centroids_ssu_align_best.fna"
-
-    missing = [str(p) for p in [arch_msa, bact_msa] if not p.exists()]
-    if missing:
-        raise FileNotFoundError(
-            "Missing required choose-best FASTAs for raxml-check:\n"
-            + "\n".join(f"  - {x}" for x in missing)
-        )
-
-    key_outputs = [out / "summary.tsv", out / "report.json"]
-    if any(p.exists() for p in key_outputs) and not force:
-        raise FileExistsError(f"RAxML-check outputs already exist under {out}. Use --force to overwrite.")
-
-    _ensure_dir(out)
-
-    report = {
-        "inputs": {
-            "choose_best_dir": str(choose_best_dir),
-            "raxml_ng_bin": raxml_ng_bin,
-            "threads": threads,
-        },
-        "domains": {},
-        "outputs": {
-            "summary_tsv": str(out / "summary.tsv"),
-            "report_json": str(out / "report.json"),
-        },
-    }
-
-    summary_rows: List[List[str]] = []
-
-    for domain, msa in (("archaea", arch_msa), ("bacteria", bact_msa)):
-        stats = _check_one_domain(
-            domain=domain,
-            msa_fasta=msa,
-            out_dir=out,
-            raxml_ng_bin=raxml_ng_bin,
-            threads=threads,
-        )
-
-        report["domains"][domain] = stats
-        summary_rows.append([
-            domain,
-            str(stats["status"]),
-            str(stats["n_sequences"]),
-            str(stats["alignment_length"]),
-            str(stats["phy_source"]),
-            str(stats["msa_fasta"]),
-            str(stats["reduced_phy"]),
-            str(stats["log_path"]),
-        ])
-
-    with (out / "summary.tsv").open("w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f, delimiter="\t")
-        w.writerow([
-            "domain",
-            "status",
-            "n_sequences",
-            "alignment_length",
-            "phy_source",
-            "msa_fasta",
-            "reduced_phy",
-            "log_path",
-        ])
-        w.writerows(summary_rows)
-
-    (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-
-    _LOGGER.info("RAxML-check complete.")
+        prefix = f"{domain}_raxml-check"
+        run_cmd([raxml_ng_bin, "--check", "--msa", str(msa.resolve()), "--model", "GTR+G", "--prefix", prefix,
+                 "--threads", str(threads)], cwd=out, log_path=out / f"{prefix}.stdout.log")
+        reduced = out / f"{prefix}.raxml.reduced.phy"
+        source = "raxml-ng"
+        if domain == "archaea" or not reduced.exists():
+            write_phylip(records, reduced)
+            source = "converted"
+        kept = read_phylip(reduced)
+        removed = sorted({g for g, _ in records} - {g for g, _ in kept})
+        if removed:
+            _LOGGER.info("%s: raxml-ng removed %d sequences identical to another after alignment", domain, len(removed))
+        if len(kept) < min_genomes:
+            _LOGGER.warning("%s: only %d sequences left after raxml-ng --check; no %s reference is built",
+                            domain, len(kept), domain)
+            reduced.unlink()
+            report[domain] = {"status": "too_few_genomes", "n": len(kept)}
+            continue
+        _LOGGER.info("%s: %d sequences x %d columns (%s)", domain, len(kept), len(kept[0][1]), source)
+        report[domain] = {"status": "ok", "phylip": source, "n_in": len(records), "n_out": len(kept),
+                          "removed_identical": removed}
+    write_json(out / "report.json", report)

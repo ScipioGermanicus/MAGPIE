@@ -1,145 +1,109 @@
+"""
+Format the input MAGs (script 01_formating_genomes.sh).
+
+Every genome is written to <out>/mags/<genome_id>_genomic.fna.gz and recorded in id_map.tsv
+(original_filename, original_id, new_id). Genome IDs are the file names without FASTA extensions,
+or MAG0001, MAG0002, ... with --sequential-ids (files sorted by name, as in script 01), or taken
+from --rename-map. Characters outside [A-Za-z0-9._-] are replaced by '_', because IDs become
+FASTA, PHYLIP and Newick labels.
+"""
 from __future__ import annotations
 
-from pathlib import Path
-import gzip
+import csv
 import json
-import shutil
-from typing import Iterable
+import logging
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List
 
-FASTA_SUFFIXES = (".fa", ".fna", ".fasta")
-FASTA_GZ_SUFFIXES = (".fa.gz", ".fna.gz", ".fasta.gz")
+from ..pipeline import MagpieError
+from ..util.io import copy_or_decompress, ensure_dir, iter_fasta, list_fasta_files, open_text, sanitise_id, strip_fasta_suffix
 
-
-def _is_fasta(p: Path) -> bool:
-    s = p.name.lower()
-    return s.endswith(FASTA_SUFFIXES) or s.endswith(FASTA_GZ_SUFFIXES)
-
-
-def _iter_mag_fastas(mags_dir: Path) -> list[Path]:
-    files = [p for p in mags_dir.iterdir() if p.is_file() and _is_fasta(p)]
-    return sorted(files, key=lambda x: x.name.lower())
+_LOGGER = logging.getLogger("magpie.prep")
 
 
-def _decompress_gz_to_bytes(src_gz: Path) -> bytes:
-    with gzip.open(src_gz, "rb") as f:
-        return f.read()
+@dataclass(frozen=True)
+class GenomeInput:
+    path: Path
+    original_id: str
+    genome_id: str
 
 
-def _read_bytes_from_plain(src: Path) -> bytes:
-    return src.read_bytes()
+def _read_rename_map(path: Path) -> Dict[str, str]:
+    """Two columns: original file name or ID, new ID. A header line is optional."""
+    mapping: Dict[str, str] = {}
+    with open_text(path) as fh:
+        for i, row in enumerate(csv.reader(fh, delimiter="\t")):
+            if not row or not row[0].strip() or row[0].startswith("#"):
+                continue
+            if len(row) < 2:
+                raise MagpieError(f"--rename-map line {i + 1} needs two tab-separated columns: {path}")
+            old, new = row[0].strip(), row[1].strip()
+            if i == 0 and old.lower() in {"original_filename", "original", "original_id", "old_id", "raw_id"}:
+                continue
+            mapping[old] = new
+    return mapping
 
 
-def _write_gz_bytes(dst_gz: Path, data: bytes) -> None:
-    dst_gz.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(dst_gz, "wb") as f:
-        f.write(data)
-
-
-def _as_fna_bytes(src: Path) -> bytes:
-    """
-    Read a FASTA file (.fa/.fna/.fasta or gzipped) and return raw bytes.
-
-    v0.1: no header rewriting; just bytes-in/bytes-out.
-    """
-    name = src.name.lower()
-    if name.endswith(".gz"):
-        return _decompress_gz_to_bytes(src)
-    return _read_bytes_from_plain(src)
-
-
-def prep_step(
-    *,
-    mags: Path,
-    out: Path,
-    rename_map: Path | None,
-    force: bool,
-    # New knobs for your formatting step:
-    sequential_ids: bool = False,
-    out_prefix: str = "MAG",
-    pad: int = 4,
-) -> None:
-    """
-    Prepare MAGs for downstream steps.
-
-    v0.1 behaviour:
-      - copies MAG FASTAs into out/mags/
-      - optionally assigns sequential IDs (MAG0001...) and writes gzipped files
-      - writes a mapping file (id_map.tsv) and a prep_report.json
-    """
-    out.mkdir(parents=True, exist_ok=True)
-
-    out_mags = out / "mags"
-    out_mags.mkdir(parents=True, exist_ok=True)
-
-    report_fp = out / "prep_report.json"
-    map_fp = out / "id_map.tsv"
-
-    if (report_fp.exists() or map_fp.exists()) and not force:
-        raise FileExistsError(f"{out} already contains prep outputs. Use --force to overwrite.")
-
-    files = _iter_mag_fastas(mags)
+def plan_genomes(mags: Path, rename_map: Path | None, sequential_ids: bool, out_prefix: str, pad: int) -> List[GenomeInput]:
+    """Decide the genome ID of every input file (shared by validate and prep)."""
+    files = list_fasta_files(mags)
     if not files:
-        raise ValueError(f"No MAG FASTA files found in: {mags}")
-
-    # For v0.1: ignore rename_map unless you later want it for non-sequential mode
-    # (keeping signature for compatibility with your CLI).
+        raise MagpieError(f"No MAG FASTA files (.fa/.fna/.fasta, optionally .gz) found in {mags}")
     if rename_map is not None and sequential_ids:
-        raise ValueError("--rename-map cannot be used together with --sequential-ids in v0.1")
+        raise MagpieError("--rename-map cannot be combined with --sequential-ids")
 
-    # Write mapping header
-    map_lines = ["original_filename\tnew_id"]
-
-    copies: list[dict[str, str]] = []
-    i = 1
-    for src in files:
-        original = src.name
-
+    rename = _read_rename_map(rename_map) if rename_map is not None else {}
+    plan = []
+    for i, path in enumerate(files, start=1):
+        original_id = strip_fasta_suffix(path.name)
         if sequential_ids:
             new_id = f"{out_prefix}{i:0{pad}d}"
-            dst = out_mags / f"{new_id}_genomic.fna.gz"
-            data = _as_fna_bytes(src)
-            if dst.exists() and not force:
-                raise FileExistsError(f"Destination exists: {dst} (use --force)")
-            _write_gz_bytes(dst, data)
         else:
-            # Preserve ID (stem) and standardise suffix to .fna (not gz) for simplicity
-            # You can change this to always .fna.gz if you prefer.
-            new_id = src.stem  # note: for .fa.gz, stem becomes ".fa" -> not ideal; handle below
-            name_lower = src.name.lower()
-            if name_lower.endswith(".fa.gz") or name_lower.endswith(".fna.gz") or name_lower.endswith(".fasta.gz"):
-                # For *.gz, Path.stem strips only ".gz", leaving ".fa" etc. behind.
-                # Normalize by removing the second suffix as well.
-                new_id = src.name[: -len(".gz")]
-                for suff in (".fa", ".fna", ".fasta"):
-                    if new_id.lower().endswith(suff):
-                        new_id = new_id[: -len(suff)]
-                        break
+            new_id = rename.get(path.name, rename.get(original_id, original_id))
+        plan.append(GenomeInput(path, original_id, sanitise_id(new_id)))
 
-            dst = out_mags / f"{new_id}.fna"
-            if dst.exists() and not force:
-                raise FileExistsError(f"Destination exists: {dst} (use --force)")
-            # Just copy bytes (decompress if needed)
-            data = _as_fna_bytes(src)
-            dst.write_bytes(data)
+    dupes = sorted(g for g, c in Counter(p.genome_id for p in plan).items() if c > 1)
+    if dupes:
+        raise MagpieError(f"{len(dupes)} genome IDs are not unique (e.g. {', '.join(dupes[:5])}); "
+                          "rename the files or use --rename-map / --sequential-ids")
+    if rename:
+        unmapped = [p.path.name for p in plan if p.path.name not in rename and p.original_id not in rename]
+        if unmapped:
+            _LOGGER.warning("%d input files are not in --rename-map and keep their own name (e.g. %s)",
+                            len(unmapped), ", ".join(unmapped[:3]))
+    return plan
 
-        map_lines.append(f"{original}\t{new_id}")
-        copies.append({"src": str(src), "dest": str(dst), "new_id": new_id})
-        i += 1
 
-    map_fp.write_text("\n".join(map_lines) + "\n", encoding="utf-8")
+def prep_step(*, mags: Path, out: Path, rename_map: Path | None, sequential_ids: bool, out_prefix: str, pad: int) -> None:
+    mags_out = ensure_dir(out / "mags")
+    plan = plan_genomes(mags, rename_map, sequential_ids, out_prefix, pad)
 
-    report = {
-        "mags_dir": str(mags),
-        "out_dir": str(out),
-        "n_inputs": len(files),
-        "sequential_ids": sequential_ids,
-        "out_prefix": out_prefix if sequential_ids else None,
-        "pad": pad if sequential_ids else None,
-        "outputs": {
-            "mags_dir": str(out_mags),
-            "id_map_tsv": str(map_fp),
-            "prep_report_json": str(report_fp),
-        },
-        "copies": copies,
-    }
-    report_fp.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    rows = []
+    for g in plan:
+        dst = mags_out / f"{g.genome_id}_genomic.fna.gz"
+        copy_or_decompress(g.path, dst)
+        contigs, total = set(), 0
+        for header, seq in iter_fasta(dst):
+            cid = header.split()[0]
+            if cid in contigs:
+                raise MagpieError(f"Duplicate contig name '{cid}' in {g.path}")
+            contigs.add(cid)
+            total += len(seq)
+        if total == 0:
+            raise MagpieError(f"Genome file contains no sequence: {g.path}")
+        rows.append((g.path.name, g.original_id, g.genome_id, len(contigs), total))
+
+    with (out / "id_map.tsv").open("w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh, delimiter="\t", lineterminator="\n")
+        w.writerow(["original_filename", "original_id", "new_id", "n_contigs", "length"])
+        w.writerows(rows)
+
+    sanitised = [r for r in rows if not sequential_ids and rename_map is None and r[1] != r[2]]
+    if sanitised:
+        _LOGGER.warning("%d genome IDs contained characters outside [A-Za-z0-9._-] and were changed "
+                        "(e.g. %s -> %s); see id_map.tsv", len(sanitised), sanitised[0][1], sanitised[0][2])
+    (out / "prep_report.json").write_text(json.dumps({"mags_dir": str(mags), "n_genomes": len(rows)}, indent=2),
+                                          encoding="utf-8")
+    _LOGGER.info("Formatted %d genomes into %s", len(rows), mags_out)

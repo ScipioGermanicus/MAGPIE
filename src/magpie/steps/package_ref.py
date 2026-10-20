@@ -1,430 +1,128 @@
+"""
+Assemble the reference files (scripts 19_raxml_info_files.py and 20_reformat.sh; wiki: "Make the
+raxml_info files", "Copy and rename the resulting files", "Filter 16S copy files").
+
+  bac_ref/bac_ref.fna         <- 13_hmm_prep/bacteria_raxml-check.raxml.reduced_dna.fna
+  bac_ref/bac_ref.hmm         <- 14_hmm_build/bacteria_raxml-check.raxml.reduced_dna.hmm
+  bac_ref/bac_ref.tre         <- 11_iqtree/bacteria_16S_iqtree.treefile
+  bac_ref/bac_ref.model       <- 12_raxml_evaluate/bacteria_raxml.raxml.bestModel
+  bac_ref/bac_ref.raxml_info  <- RAxML 7-style info file made from bacteria_raxml.raxml.log
+  bacteria_16S_copies.txt     <- 16S copies of the reference genomes (assembly, 16S_rRNA_Count; max 10)
+(and the same for archaea / arc_ref)
+"""
 from __future__ import annotations
 
-import csv
-import json
 import logging
 import re
 import shutil
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
+
+from ..pipeline import MagpieError
+from ..util.io import ensure_dir, read_fasta_ids, write_id_list, write_json, write_tsv
 
 _LOGGER = logging.getLogger("magpie.package_ref")
 
-
-def _ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+REF_NAME = {"bacteria": "bac_ref", "archaea": "arc_ref"}
 
 
-def _read_fasta_ids(path: Path) -> List[str]:
-    ids: List[str] = []
-    if not path.exists():
-        return ids
+def parse_raxml_ng_log(log_path: Path) -> Dict[str, str]:
+    text = log_path.read_text(encoding="utf-8", errors="replace")
 
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
-            if raw.startswith(">"):
-                ids.append(raw[1:].strip().split()[0])
-    return ids
+    def find(pattern: str, what: str) -> re.Match:
+        m = re.search(pattern, text, flags=re.MULTILINE)
+        if m is None:
+            raise MagpieError(f"Could not find {what} in {log_path}")
+        return m
 
-
-def _normalise_copy_id(raw: str) -> str:
-    s = raw.strip()
-
-    if s.endswith(".gz"):
-        s = s[:-3]
-
-    for suffix in (".fasta", ".fna", ".fa"):
-        if s.endswith(suffix):
-            s = s[: -len(suffix)]
-
-    for suffix in ("_16S", "_genomic"):
-        if s.endswith(suffix):
-            s = s[: -len(suffix)]
-
-    return s
+    called = find(r"^(RAxML-NG was called at .+ as follows:)\s*\n\s*\n?(.+)$", "the RAxML-NG command line")
+    patterns = re.search(r"Alignment comprises\s+\d+\s+partitions?\s+and\s+(\d+)\s+patterns", text) or \
+        find(r"Alignment sites / patterns:\s*\d+\s*/\s*(\d+)", "the number of alignment patterns")
+    base = find(r"Base frequencies \(\w+\):\s*([0-9.eE+\- ]+)$", "base frequencies").group(1).split()
+    rates = find(r"Substitution rates \(\w+\):\s*([0-9.eE+\- ]+)$", "substitution rates").group(1).split()
+    loglik = find(r"Final LogLikelihood:\s+(-?[0-9.eE+\-]+)", "the final log-likelihood").group(1)
+    elapsed = re.search(r"Elapsed time:\s+([0-9.eE+\-]+)\s+seconds", text)
+    return {"called_line": called.group(1).strip(), "cmd_line": called.group(2).strip(),
+            "patterns": patterns.group(1), "base_freqs": " ".join(base), "subs_rates": " ".join(rates),
+            "final_ll": loglik, "elapsed": elapsed.group(1) if elapsed else "0.0"}
 
 
-def _read_copy_table(path: Path) -> Dict[str, int]:
-    out: Dict[str, int] = {}
-
-    if not path.exists():
-        _LOGGER.warning("16S copy-count input table does not exist: %s", path)
-        return out
-
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line:
-                continue
-
-            parts = line.split("\t")
-            if len(parts) < 2:
-                continue
-
-            raw_gid = parts[0].strip()
-            raw_count = parts[1].strip()
-
-            if raw_gid.lower() in {"assembly", "genome", "genome_id"}:
-                continue
-
-            try:
-                count = int(float(raw_count))
-            except ValueError:
-                continue
-
-            gid = _normalise_copy_id(raw_gid)
-
-            if gid in out:
-                _LOGGER.warning(
-                    "Duplicate 16S copy-count ID after normalisation in %s: %s. Keeping first value.",
-                    path,
-                    gid,
-                )
-                continue
-
-            out[gid] = count
-
-    return out
-
-
-def _write_filtered_copy_table(
-    *,
-    included_genomes: List[str],
-    copy_table_in: Path,
-    out_path: Path,
-) -> Tuple[int, int]:
-    copies = _read_copy_table(copy_table_in)
-
-    n_written = 0
-    n_capped = 0
-    missing: List[str] = []
-
-    with out_path.open("w", encoding="utf-8", newline="") as fh:
-        w = csv.writer(fh, delimiter="\t")
-        w.writerow(["assembly", "16S_rRNA_Count"])
-
-        for gid in included_genomes:
-            norm_gid = _normalise_copy_id(gid)
-
-            if norm_gid not in copies:
-                missing.append(gid)
-                continue
-
-            count = copies[norm_gid]
-
-            if count > 10:
-                count = 10
-                n_capped += 1
-
-            w.writerow([gid, str(count)])
-            n_written += 1
-
-    if included_genomes and n_written == 0:
-        preview_ids = ", ".join(included_genomes[:10])
-        preview_copy_ids = ", ".join(sorted(copies.keys())[:10])
-        raise ValueError(
-            f"No 16S copy-count rows matched the final reference FASTA IDs for {out_path}.\n"
-            f"Input copy table: {copy_table_in}\n"
-            f"First final FASTA IDs: {preview_ids}\n"
-            f"First copy-table IDs after normalisation: {preview_copy_ids}\n"
-            f"This usually indicates that rrna IDs and final reference FASTA IDs are not using the same genome ID convention."
-        )
-
-    if missing:
-        _LOGGER.warning(
-            "%d final reference genomes had no 16S copy-count row for %s. First missing: %s",
-            len(missing),
-            out_path,
-            ", ".join(missing[:10]),
-        )
-
-    return (n_written, n_capped)
-
-
-def _resolve_copy_table(rrna_dir: Path, domain: str) -> Path:
-    candidates = [
-        rrna_dir / f"{domain}_16S_copies.txt",
-        rrna_dir / f"{domain}_16S_copies.tsv",
-        rrna_dir / domain / f"{domain}_16S_copies.txt",
-        rrna_dir / domain / f"{domain}_16S_copies.tsv",
-        rrna_dir / domain / "16S_copies.txt",
-        rrna_dir / domain / "16S_copies.tsv",
-        rrna_dir / domain / "copies.txt",
-        rrna_dir / domain / "copies.tsv",
+def write_raxml_info(log_path: Path, out_path: Path) -> None:
+    """RAxML 7.x-style info file for SEPP/pplacer, in the layout of script 19 (wiki template)."""
+    p = parse_raxml_ng_log(log_path)
+    txt = [
+        "This is RAxML version 7.7.2 released by Alexandros Stamatakis on July 31 2013.",
+        "",
+        "This is a RAxML_info file from an --evaluate run, manually reformatted",
+        "",
+        "Partition: 0",
+        f"Alignment Patterns: {p['patterns']}",
+        "Name: No Name Provided",
+        "DataType: DNA",
+        "Substitution Matrix: GTR",
+        "",
+        p["called_line"],
+        "",
+        p["cmd_line"],
+        "",
+        f"Base frequencies: {p['base_freqs']}",
+        "",
+        f"Inference[0]: Time {p['elapsed']} CAT-based likelihood -0000, best rearrangement setting 5",
+        f"alpha[0]: 1.000000 rates[0] ac ag at cg ct gt: {p['subs_rates']}",
+        "",
+        "",
+        "NOT conducting any final model optimizations on all 1 trees under CAT-based",
+        "model ....",
+        "",
+        f"Final GAMMA  likelihood: {p['final_ll']}",
+        "",
     ]
-
-    for p in candidates:
-        if p.exists():
-            return p
-
-    checked = "\n".join(f"  - {p}" for p in candidates)
-    raise FileNotFoundError(
-        f"Could not find 16S copy-count table for {domain}. Checked:\n{checked}"
-    )
-
-
-def _copy_required(src: Path, dst: Path) -> None:
-    if not src.exists():
-        raise FileNotFoundError(f"Required input file missing: {src}")
-    shutil.copy2(src, dst)
-
-
-def _parse_raxml_ng_log(log_path: Path) -> Dict[str, str]:
-    patterns = None
-    base_freqs = None
-    subs_rates = None
-    final_ll = None
-    elapsed = None
-    called_line = None
-    cmd_line = None
-
-    with log_path.open("r", encoding="utf-8", errors="replace") as fh:
-        lines = fh.readlines()
-
-    for i, line in enumerate(lines):
-        if "RAxML-NG was called at" in line:
-            called_line = line.rstrip("\n")
-            for j in range(i + 1, len(lines)):
-                cmd = lines[j].strip()
-                if cmd:
-                    cmd_line = cmd
-                    break
-            break
-
-    for raw in lines:
-        line = raw.strip()
-
-        m = re.search(r"Alignment comprises\s+(\d+)\s+partitions\s+and\s+(\d+)\s+patterns", line)
-        if m:
-            patterns = m.group(2)
-            continue
-
-        if line.startswith("Base frequencies (ML):"):
-            base_freqs = line.split(":", 1)[1].strip().split()
-            continue
-
-        if line.startswith("Substitution rates (ML):"):
-            subs_rates = line.split(":", 1)[1].strip().split()
-            continue
-
-        m2 = re.search(r"Final LogLikelihood:\s+(-?[0-9.eE+-]+)", line)
-        if m2:
-            final_ll = m2.group(1)
-            continue
-
-        m3 = re.search(r"Elapsed time:\s+([0-9.eE+-]+)\s+seconds", line)
-        if m3:
-            elapsed = m3.group(1)
-            continue
-
-    if patterns is None:
-        raise RuntimeError(f"Could not parse alignment patterns from {log_path}")
-    if base_freqs is None:
-        raise RuntimeError(f"Could not parse base frequencies from {log_path}")
-    if subs_rates is None:
-        raise RuntimeError(f"Could not parse substitution rates from {log_path}")
-    if final_ll is None:
-        raise RuntimeError(f"Could not parse final log-likelihood from {log_path}")
-    if elapsed is None:
-        elapsed = "0.0"
-    if called_line is None or cmd_line is None:
-        raise RuntimeError(f"Could not find 'RAxML-NG was called at' section in {log_path}")
-
-    return {
-        "patterns": patterns,
-        "base_freqs": " ".join(base_freqs),
-        "subs_rates": " ".join(subs_rates),
-        "final_ll": final_ll,
-        "elapsed": elapsed,
-        "called_line": called_line,
-        "cmd_line": cmd_line,
-    }
-
-
-def _write_raxml_info(log_path: Path, out_path: Path) -> None:
-    parsed = _parse_raxml_ng_log(log_path)
-
-    txt: List[str] = []
-    txt.append("This is RAxML version 7.7.2 released by Alexandros Stamatakis on July 31 2013.")
-    txt.append("")
-    txt.append("This is a RAxML_info file from an --evaluate run, manually reformatted")
-    txt.append("")
-    txt.append("Partition: 0")
-    txt.append(f"Alignment Patterns: {parsed['patterns']}")
-    txt.append("Name: No Name Provided")
-    txt.append("DataType: DNA")
-    txt.append("Substitution Matrix: GTR")
-    txt.append("")
-    txt.append(parsed["called_line"])
-    txt.append("")
-    txt.append(parsed["cmd_line"])
-    txt.append("")
-    txt.append(f"Base frequencies: {parsed['base_freqs']}")
-    txt.append("")
-    txt.append(f"Inference[0]: Time {parsed['elapsed']} CAT-based likelihood -0000, best rearrangement setting 5")
-    txt.append(f"alpha[0]: 1.000000 rates[0] ac ag at cg ct gt: {parsed['subs_rates']}")
-    txt.append("")
-    txt.append("")
-    txt.append("NOT conducting any final model optimizations on all 1 trees under CAT-based")
-    txt.append("model ....")
-    txt.append("")
-    txt.append(f"Final GAMMA  likelihood: {parsed['final_ll']}")
-    txt.append("")
-
     out_path.write_text("\n".join(txt), encoding="utf-8")
 
 
-def _package_one_domain(
-    *,
-    domain: str,
-    hmm_prep_dir: Path,
-    hmm_build_dir: Path,
-    iqtree_dir: Path,
-    raxml_evaluate_dir: Path,
-    rrna_dir: Path,
-    out_root: Path,
-) -> Dict[str, object]:
-    ref_name = "bac_ref" if domain == "bacteria" else "arc_ref"
-    ref_dir = out_root / ref_name
-    _ensure_dir(ref_dir)
+def _read_copies(path: Path) -> Dict[str, int]:
+    out = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[1].strip().isdigit():
+            out[parts[0].strip()] = int(parts[1])
+    return out
 
-    prefix = "bac_ref" if domain == "bacteria" else "arc_ref"
 
-    fna_src = hmm_prep_dir / f"{domain}_raxml-check.raxml.reduced_dna.fna"
-    hmm_src = hmm_build_dir / f"{domain}_raxml-check.raxml.reduced_dna.hmm"
-    tree_src = iqtree_dir / f"{domain}_16S_iqtree.treefile"
-    model_src = raxml_evaluate_dir / f"{domain}_raxml.raxml.bestModel"
-    log_src = raxml_evaluate_dir / f"{domain}_raxml.raxml.log"
-    copies_src = _resolve_copy_table(rrna_dir, domain)
-
-    fna_dst = ref_dir / f"{prefix}.fna"
-    hmm_dst = ref_dir / f"{prefix}.hmm"
-    tree_dst = ref_dir / f"{prefix}.tre"
-    model_dst = ref_dir / f"{prefix}.model"
-    info_dst = ref_dir / f"{prefix}.raxml_info"
-
-    if not fna_src.exists():
-        _LOGGER.warning("Skipping %s package-ref: missing FASTA input %s", domain, fna_src)
-        return {
-            "domain": domain,
-            "status": "skipped_missing_input",
-            "ref_dir": str(ref_dir),
+def package_ref_step(*, rrna_dir: Path, iqtree_dir: Path, raxml_evaluate_dir: Path, hmm_prep_dir: Path,
+                     hmm_build_dir: Path, out: Path, max_16s_copies: int) -> None:
+    built: List[str] = []
+    report = {}
+    for domain, ref in REF_NAME.items():
+        src = {
+            "fna": hmm_prep_dir / f"{domain}_raxml-check.raxml.reduced_dna.fna",
+            "hmm": hmm_build_dir / f"{domain}_raxml-check.raxml.reduced_dna.hmm",
+            "tre": iqtree_dir / f"{domain}_16S_iqtree.treefile",
+            "model": raxml_evaluate_dir / f"{domain}_raxml.raxml.bestModel",
+            "log": raxml_evaluate_dir / f"{domain}_raxml.raxml.log",
         }
+        if not all(p.exists() for p in src.values()):
+            _LOGGER.warning("%s: no %s is built (inputs missing; see the warnings of earlier steps)", domain, ref)
+            report[domain] = {"status": "not_built"}
+            continue
+        ref_dir = ensure_dir(out / ref)
+        for ext in ("fna", "hmm", "tre", "model"):
+            shutil.copyfile(src[ext], ref_dir / f"{ref}.{ext}")
+        write_raxml_info(src["log"], ref_dir / f"{ref}.raxml_info")
 
-    _copy_required(fna_src, fna_dst)
-    _copy_required(hmm_src, hmm_dst)
-    _copy_required(tree_src, tree_dst)
-    _copy_required(model_src, model_dst)
-    _write_raxml_info(log_src, info_dst)
-
-    fasta_ids = _read_fasta_ids(fna_dst)
-    copy_table_dst = out_root / f"{domain}_16S_copies.txt"
-
-    n_written, n_capped = _write_filtered_copy_table(
-        included_genomes=fasta_ids,
-        copy_table_in=copies_src,
-        out_path=copy_table_dst,
-    )
-
-    return {
-        "domain": domain,
-        "status": "processed",
-        "ref_dir": str(ref_dir),
-        "fna": str(fna_dst),
-        "hmm": str(hmm_dst),
-        "tree": str(tree_dst),
-        "model": str(model_dst),
-        "raxml_info": str(info_dst),
-        "copies_table": str(copy_table_dst),
-        "copy_table_input": str(copies_src),
-        "n_fasta_ids": len(fasta_ids),
-        "n_copy_rows_written": n_written,
-        "n_copy_rows_capped": n_capped,
-    }
-
-
-def package_ref_step(
-    *,
-    rrna_dir: Path,
-    iqtree_dir: Path,
-    raxml_evaluate_dir: Path,
-    hmm_prep_dir: Path,
-    hmm_build_dir: Path,
-    out: Path,
-    force: bool,
-) -> None:
-    key_outputs = [out / "summary.tsv", out / "report.json"]
-    if any(p.exists() for p in key_outputs) and not force:
-        raise FileExistsError(f"package-ref outputs already exist under {out}. Use --force to overwrite.")
-
-    _ensure_dir(out)
-
-    report = {
-        "inputs": {
-            "rrna_dir": str(rrna_dir),
-            "iqtree_dir": str(iqtree_dir),
-            "raxml_evaluate_dir": str(raxml_evaluate_dir),
-            "hmm_prep_dir": str(hmm_prep_dir),
-            "hmm_build_dir": str(hmm_build_dir),
-        },
-        "domains": {},
-        "outputs": {
-            "summary_tsv": str(out / "summary.tsv"),
-            "report_json": str(out / "report.json"),
-            "bac_ref": str(out / "bac_ref"),
-            "arc_ref": str(out / "arc_ref"),
-        },
-    }
-
-    summary_rows: List[List[str]] = []
-
-    for domain in ("bacteria", "archaea"):
-        stats = _package_one_domain(
-            domain=domain,
-            hmm_prep_dir=hmm_prep_dir,
-            hmm_build_dir=hmm_build_dir,
-            iqtree_dir=iqtree_dir,
-            raxml_evaluate_dir=raxml_evaluate_dir,
-            rrna_dir=rrna_dir,
-            out_root=out,
-        )
-
-        report["domains"][domain] = stats
-        summary_rows.append([
-            domain,
-            str(stats["status"]),
-            str(stats.get("ref_dir", "")),
-            str(stats.get("fna", "")),
-            str(stats.get("hmm", "")),
-            str(stats.get("tree", "")),
-            str(stats.get("model", "")),
-            str(stats.get("raxml_info", "")),
-            str(stats.get("copies_table", "")),
-            str(stats.get("copy_table_input", "")),
-            str(stats.get("n_fasta_ids", 0)),
-            str(stats.get("n_copy_rows_written", 0)),
-            str(stats.get("n_copy_rows_capped", 0)),
-        ])
-
-    with (out / "summary.tsv").open("w", encoding="utf-8", newline="") as fh:
-        w = csv.writer(fh, delimiter="\t")
-        w.writerow([
-            "domain",
-            "status",
-            "ref_dir",
-            "fna",
-            "hmm",
-            "tree",
-            "model",
-            "raxml_info",
-            "copies_table",
-            "copy_table_input",
-            "n_fasta_ids",
-            "n_copy_rows_written",
-            "n_copy_rows_capped",
-        ])
-        w.writerows(summary_rows)
-
-    (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-
-    _LOGGER.info("package-ref step complete.")
+        ids = read_fasta_ids(ref_dir / f"{ref}.fna")
+        copies = _read_copies(rrna_dir / f"{domain}_16S_copies.txt")
+        missing = [g for g in ids if g not in copies]
+        if missing:
+            raise MagpieError(f"{domain}: {len(missing)} reference genomes have no 16S copy number (e.g. {missing[:3]})")
+        capped = sum(1 for g in ids if copies[g] > max_16s_copies)
+        write_tsv(out / f"{domain}_16S_copies.txt", ["assembly", "16S_rRNA_Count"],
+                  [[g, min(copies[g], max_16s_copies)] for g in ids])
+        built.append(domain)
+        _LOGGER.info("%s: %s with %d reference genomes (%d copy numbers capped at %d)", domain, ref, len(ids),
+                     capped, max_16s_copies)
+        report[domain] = {"status": "built", "n_genomes": len(ids), "capped": capped}
+    if not built:
+        raise MagpieError("No reference could be built for either domain")
+    write_id_list(out / "domains_built.txt", built)
+    write_json(out / "report.json", report)

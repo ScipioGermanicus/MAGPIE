@@ -1,290 +1,151 @@
+"""
+eggNOG-mapper annotation of the reference genomes (scripts 22/23; command as in the PICRUSt2 wiki,
+"Annotate genomes"):
+
+  emapper.py -m diamond --itype genome --genepred prodigal --data_dir <eggnog_data>
+             -i <genome>.fna -o <genome> --output_dir <out>/emapper --cpu N --override
+
+Existing annotations are reused with --eggnog-existing-dir: files named <name>.emapper.annotations
+(optionally .gz) where <name> is the MAGPIE genome ID, the original file name or its stem (e.g.
+BC13.bin.1.143.emapper.annotations or MAG1988.emapper.annotations). eggNOG-mapper is run only
+for reference genomes without an existing annotation, and only if --eggnog-data-dir is given.
+
+Only genomes in bac_ref.fna / arc_ref.fna are annotated. The step keeps its directory between
+runs: genomes whose annotation finished earlier are not annotated again.
+
+Output: annotations/<genome_id>.emapper.annotations for every reference genome.
+"""
 from __future__ import annotations
 
-import csv
-import json
+import gzip
 import logging
 import shutil
-import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional
+
+from ..pipeline import MagpieError
+from ..util.ids import IdLookup
+from ..util.io import ensure_dir, read_fasta_ids, read_id_list, write_json, write_tsv
+from ..util.shell import ShellError, run_cmd
 
 _LOGGER = logging.getLogger("magpie.eggnog")
 
-FASTA_EXTS = (".fa", ".fna", ".fasta")
-GZ_EXT = ".gz"
+SUFFIX = ".emapper.annotations"
+REF_NAME = {"bacteria": "bac_ref", "archaea": "arc_ref"}
 
 
-def _ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def _strip_fasta_suffix(name: str) -> str:
-    s = name.strip()
-    if s.lower().endswith(GZ_EXT):
-        s = s[:-len(GZ_EXT)]
-    for ext in FASTA_EXTS:
-        if s.lower().endswith(ext):
-            s = s[:-len(ext)]
-            break
-    return s
-
-
-def _iter_genome_files(dir_: Path) -> Iterable[Path]:
-    if not dir_.exists():
-        return
-    for p in sorted(dir_.iterdir(), key=lambda x: x.name):
-        if not p.is_file():
+def find_existing_annotations(ann_dir: Path, lookup: IdLookup) -> Dict[str, Path]:
+    """MAGPIE genome ID -> existing annotation file in ann_dir."""
+    found: Dict[str, Path] = {}
+    for p in sorted(ann_dir.iterdir()):
+        name = p.name
+        if not p.is_file() or not (name.endswith(SUFFIX) or name.endswith(SUFFIX + ".gz")):
             continue
-        low = p.name.lower()
-        if any(low.endswith(ext) for ext in FASTA_EXTS) or any(low.endswith(ext + GZ_EXT) for ext in FASTA_EXTS):
-            yield p
-
-
-def _run_command(cmd: list[str]) -> None:
-    _LOGGER.debug("Running command: %s", " ".join(cmd))
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"Command failed:\n"
-            f"  {' '.join(cmd)}\n"
-            f"stdout:\n{proc.stdout}\n"
-            f"stderr:\n{proc.stderr}"
-        )
-
-
-def _find_annotation_files(dir_: Path) -> Dict[str, Path]:
-    """
-    Return mapping:
-      genome_id -> <dir>/<genome_id>.emapper.annotations
-    """
-    out: Dict[str, Path] = {}
-    if not dir_.exists():
-        return out
-
-    for p in sorted(dir_.iterdir(), key=lambda x: x.name):
-        if not p.is_file():
+        gid = lookup.resolve(name[: name.index(SUFFIX)])
+        if gid is None:
             continue
-        if not p.name.endswith(".emapper.annotations"):
-            continue
-        gid = p.name[: -len(".emapper.annotations")]
-        if gid in out:
-            raise ValueError(f"Duplicate eggNOG annotation for genome_id '{gid}' in {dir_}")
-        out[gid] = p
-    return out
+        if gid in found:
+            raise MagpieError(f"Two eggNOG annotation files for genome {gid} in {ann_dir}: {found[gid].name}, {name}")
+        found[gid] = p
+    return found
 
 
-def _copy_existing_annotations(
-    *,
-    genome_ids: List[str],
-    existing_dir: Path,
-    out_annotations_dir: Path,
-) -> Tuple[int, List[str]]:
-    found = _find_annotation_files(existing_dir)
-    copied = 0
-    missing: List[str] = []
-
-    _ensure_dir(out_annotations_dir)
-
-    for gid in genome_ids:
-        src = found.get(gid)
-        if src is None:
-            missing.append(gid)
-            continue
-        dst = out_annotations_dir / src.name
-        shutil.copy2(src, dst)
-        copied += 1
-
-    return copied, missing
+def annotation_complete(path: Path, require_footer: bool) -> bool:
+    """A file written by eggNOG-mapper has a '#query' header and ends with '## Total time'."""
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    opener = gzip.open if path.name.endswith(".gz") else open
+    header = footer = False
+    with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("#query"):
+                header = True
+            elif line.startswith("## Total time"):
+                footer = True
+    return header and (footer or not require_footer)
 
 
-def _run_prodigal(
-    *,
-    genome_fp: Path,
-    proteins_out: Path,
-    prodigal_bin: str,
-) -> None:
-    cmd = [
-        prodigal_bin,
-        "-i",
-        str(genome_fp),
-        "-a",
-        str(proteins_out),
-        "-p",
-        "single",
-    ]
-    _run_command(cmd)
+def _emapper_one(gid: str, genome_gz: Path, emapper_dir: Path, emapper_bin: str, data_dir: Path, threads: int) -> None:
+    tmp = ensure_dir(emapper_dir / "tmp" / gid)
+    fna = tmp / f"{gid}.fna"
+    with gzip.open(genome_gz, "rb") as fin, fna.open("wb") as fout:
+        shutil.copyfileobj(fin, fout)
+    try:
+        run_cmd([emapper_bin, "-m", "diamond", "--itype", "genome", "--genepred", "prodigal",
+                 "--data_dir", str(data_dir), "-i", str(fna), "-o", gid, "--output_dir", str(emapper_dir),
+                 "--temp_dir", str(tmp), "--cpu", str(threads), "--override"],
+                log_path=emapper_dir / "logs" / f"{gid}.log")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if not annotation_complete(emapper_dir / f"{gid}{SUFFIX}", require_footer=True):
+        raise MagpieError(f"eggNOG-mapper did not produce a complete annotation for {gid}")
 
 
-def _run_emapper(
-    *,
-    proteins_faa: Path,
-    sample_id: str,
-    output_dir: Path,
-    emapper_bin: str,
-    eggnog_data_dir: Path,
-    cpus: int,
-) -> None:
-    cmd = [
-        emapper_bin,
-        "-m",
-        "diamond",
-        "--data_dir",
-        str(eggnog_data_dir),
-        "-i",
-        str(proteins_faa),
-        "-o",
-        sample_id,
-        "--output_dir",
-        str(output_dir),
-        "--cpu",
-        str(cpus),
-    ]
-    _run_command(cmd)
+def eggnog_step(*, prep_dir: Path, package_ref_dir: Path, out: Path, eggnog_existing_dir: Optional[Path],
+                eggnog_data_dir: Optional[Path], emapper_bin: str, cpus: int, jobs: int) -> None:
+    refs = {d: read_fasta_ids(package_ref_dir / REF_NAME[d] / f"{REF_NAME[d]}.fna")
+            for d in read_id_list(package_ref_dir / "domains_built.txt")}
+    domain_of = {g: d for d, ids in refs.items() for g in ids}
+    shutil.rmtree(out / "annotations", ignore_errors=True)
+    ann_dir = ensure_dir(out / "annotations")
+    emapper_dir = ensure_dir(out / "emapper")
 
+    existing = find_existing_annotations(eggnog_existing_dir, IdLookup(prep_dir / "id_map.tsv")) \
+        if eggnog_existing_dir is not None else {}
+    status: Dict[str, str] = {}
+    todo: List[str] = []
+    for gid in sorted(domain_of):
+        if gid in existing:
+            src = existing[gid]
+            if not annotation_complete(src, require_footer=False):
+                raise MagpieError(f"{src} has no '#query' header line; is it an eggNOG-mapper annotation file?")
+            dst = ann_dir / f"{gid}{SUFFIX}"
+            if src.name.endswith(".gz"):
+                with gzip.open(src, "rb") as fin, dst.open("wb") as fout:
+                    shutil.copyfileobj(fin, fout)
+            else:
+                dst.symlink_to(src.resolve())
+            status[gid] = "existing"
+        elif annotation_complete(emapper_dir / f"{gid}{SUFFIX}", require_footer=True):
+            status[gid] = "annotated_earlier"
+        else:
+            todo.append(gid)
 
-def eggnog_step(
-    *,
-    prep_dir: Path,
-    out: Path,
-    cpus: int,
-    force: bool,
-    eggnog_existing_dir: Path | None,
-    eggnog_data_dir: Path | None,
-    prodigal_bin: str,
-    emapper_bin: str,
-) -> None:
-    """
-    Either reuse existing eggNOG annotations or run Prodigal + eggNOG-mapper
-    on prepared MAGs under prep_dir/mags.
-
-    Outputs:
-      out/proteins/*.faa
-      out/annotations/*.emapper.annotations
-      out/summary.tsv
-      out/report.json
-    """
-    mags_dir = prep_dir / "mags"
-    if not mags_dir.exists():
-        raise FileNotFoundError(f"Prepared MAG directory not found: {mags_dir}")
-
-    proteins_dir = out / "proteins"
-    annotations_dir = out / "annotations"
-
-    key_outputs = [out / "summary.tsv", out / "report.json"]
-    if any(p.exists() for p in key_outputs) and not force:
-        raise FileExistsError(f"eggNOG outputs already exist under {out}. Use --force to overwrite.")
-
-    _ensure_dir(out)
-    _ensure_dir(proteins_dir)
-    _ensure_dir(annotations_dir)
-
-    genome_files = list(_iter_genome_files(mags_dir))
-    if not genome_files:
-        raise ValueError(f"No prepared MAG FASTA files found in: {mags_dir}")
-
-    genome_ids = [_strip_fasta_suffix(p.name) for p in genome_files]
-
-    rows: List[List[str]] = []
-    report = {
-        "inputs": {
-            "prep_dir": str(prep_dir),
-            "mags_dir": str(mags_dir),
-            "eggnog_existing_dir": str(eggnog_existing_dir) if eggnog_existing_dir is not None else None,
-            "eggnog_data_dir": str(eggnog_data_dir) if eggnog_data_dir is not None else None,
-            "prodigal_bin": prodigal_bin,
-            "emapper_bin": emapper_bin,
-            "cpus": cpus,
-        },
-        "mode": "",
-        "counts": {
-            "total_genomes": len(genome_ids),
-            "completed": 0,
-            "missing_existing_annotations": 0,
-        },
-        "outputs": {
-            "proteins_dir": str(proteins_dir),
-            "annotations_dir": str(annotations_dir),
-            "summary_tsv": str(out / "summary.tsv"),
-            "report_json": str(out / "report.json"),
-        },
-    }
-
-    if eggnog_existing_dir is not None:
-        report["mode"] = "reuse_existing_annotations"
-        copied, missing = _copy_existing_annotations(
-            genome_ids=genome_ids,
-            existing_dir=eggnog_existing_dir,
-            out_annotations_dir=annotations_dir,
-        )
-
-        report["counts"]["completed"] = copied
-        report["counts"]["missing_existing_annotations"] = len(missing)
-
-        for gid in genome_ids:
-            ann = annotations_dir / f"{gid}.emapper.annotations"
-            status = "reused" if ann.exists() else "missing_existing_annotation"
-            rows.append([
-                gid,
-                status,
-                "",
-                str(ann if ann.exists() else ""),
-            ])
-
-    else:
+    if todo:
         if eggnog_data_dir is None:
-            raise ValueError(
-                "When not using --eggnog-existing-dir, you must provide --eggnog-data-dir "
-                "so MAGPIE can run eggNOG-mapper."
-            )
+            raise MagpieError(f"{len(todo)} reference genomes have no eggNOG annotation (e.g. {', '.join(todo[:5])}). "
+                              "Add them to --eggnog-existing-dir, give --eggnog-data-dir to run eggNOG-mapper, or "
+                              "rerun from the qc step with --eggnog-existing-dir so that MAGs without an annotation "
+                              "are excluded before the reference is built (magpie run --from qc ...).")
+        jobs = max(1, min(jobs, len(todo)))
+        threads = max(1, cpus // jobs)
+        _LOGGER.info("Annotating %d genomes with eggNOG-mapper (%d jobs x %d threads)", len(todo), jobs, threads)
+        failed = []
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futs = {pool.submit(_emapper_one, g, prep_dir / "mags" / f"{g}_genomic.fna.gz", emapper_dir,
+                                emapper_bin, eggnog_data_dir, threads): g for g in todo}
+            for i, fut in enumerate(as_completed(futs), start=1):
+                g = futs[fut]
+                try:
+                    fut.result()
+                    status[g] = "annotated"
+                    _LOGGER.info("eggNOG-mapper %d/%d: %s", i, len(todo), g)
+                except (ShellError, MagpieError) as e:
+                    failed.append(g)
+                    _LOGGER.error("eggNOG-mapper failed for %s: %s", g, e)
+        if failed:
+            raise MagpieError(f"eggNOG-mapper failed for {len(failed)} genomes; rerun to retry them "
+                              f"(finished genomes are kept). Logs: {emapper_dir / 'logs'}")
 
-        report["mode"] = "run_prodigal_and_emapper"
-
-        completed = 0
-        for genome_fp in genome_files:
-            gid = _strip_fasta_suffix(genome_fp.name)
-            proteins_out = proteins_dir / f"{gid}.faa"
-            annotation_out = annotations_dir / f"{gid}.emapper.annotations"
-
-            _run_prodigal(
-                genome_fp=genome_fp,
-                proteins_out=proteins_out,
-                prodigal_bin=prodigal_bin,
-            )
-
-            _run_emapper(
-                proteins_faa=proteins_out,
-                sample_id=gid,
-                output_dir=annotations_dir,
-                emapper_bin=emapper_bin,
-                eggnog_data_dir=eggnog_data_dir,
-                cpus=cpus,
-            )
-
-            if not annotation_out.exists():
-                raise FileNotFoundError(
-                    f"eggNOG-mapper did not produce expected annotation file: {annotation_out}"
-                )
-
-            completed += 1
-            rows.append([
-                gid,
-                "annotated",
-                str(proteins_out),
-                str(annotation_out),
-            ])
-
-        report["counts"]["completed"] = completed
-
-    with (out / "summary.tsv").open("w", encoding="utf-8", newline="") as fh:
-        w = csv.writer(fh, delimiter="\t")
-        w.writerow(["genome_id", "status", "proteins_faa", "annotation_file"])
-        w.writerows(rows)
-
-    (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-
-    _LOGGER.info("eggNOG step complete. Completed=%d", report["counts"]["completed"])
+    for gid, st in status.items():
+        if st in ("annotated", "annotated_earlier"):
+            (ann_dir / f"{gid}{SUFFIX}").symlink_to((emapper_dir / f"{gid}{SUFFIX}").resolve())
+    write_tsv(out / "annotation_sources.tsv", ["genome_id", "domain", "source"],
+              [[g, domain_of[g], status[g]] for g in sorted(status)])
+    counts: Dict[str, int] = {}
+    for st in status.values():
+        counts[st] = counts.get(st, 0) + 1
+    write_json(out / "report.json", {"n_reference_genomes": len(domain_of), "sources": counts})
+    _LOGGER.info("eggNOG annotations ready for %d reference genomes (%s)", len(status),
+                 ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
