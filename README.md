@@ -8,6 +8,8 @@ instructions for [creating the PICRUSt2 database](https://github.com/picrust/pic
 adapted to MAGs, in one command. Every step can also be run on its own, and the slow tools
 (GTDB-Tk, CheckM, eggNOG-mapper) can be skipped by pointing MAGPIE to results you already have.
 
+**Important note**: The current version of MAGPIE does not support integration of GTDB-Tk, checkM, and EGGNOG. Taxonomic- and functional annotation, as well as MAG quality files need to be computed separately. MAGPIE is instead pointed to existing files.
+
 ## Installation
 
 ```bash
