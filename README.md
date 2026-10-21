@@ -95,6 +95,56 @@ Genomes may be named by their original file name, file stem, or MAGPIE ID in all
 With `--eggnog-existing-dir` alone, MAGs without an annotation are excluded at the QC step so that
 every reference genome has traits; add `--eggnog-data-dir` to annotate the missing ones instead.
 
+
+## Dependencies
+
+MAGPIE is a Python package that calls external tools. All of them are available from
+[bioconda](https://bioconda.github.io/); the Installation section below creates a conda
+environment with them. The "Tested" column lists the versions MAGPIE was tested with.
+
+### Python
+
+| Package | Tested | Notes |
+|---|---|---|
+| Python | 3.11 | 3.10 or newer |
+| [typer](https://typer.tiangolo.com/) | 0.27 | installed automatically by `pip install .` |
+| pytest | | only to run the unit tests in `tests/` |
+
+### Always required
+
+| Tool | Conda package | Tested | Used in step |
+|---|---|---|---|
+| barrnap | `barrnap=0.9` | 0.9 | barrnap. Must be 0.9: barrnap 1.x has no `--reject` option. |
+| VSEARCH | `vsearch` | 2.32.0 | rrna |
+| SSU-ALIGN | `ssu-align` | 0.1.1 | align |
+| esl-reformat (Easel, installed with HMMER) | `hmmer` | 0.49 | align, hmm_prep |
+| RAxML-NG | `raxml-ng` | 2.0.3 | raxml_check, raxml_evaluate |
+| IQ-TREE | `iqtree` | 3.1.4 | iqtree. IQ-TREE 2 or 3; the command uses `-bb`, `-nt` and `-pre`. |
+| hmmbuild (HMMER) | `hmmer` | 3.4 | hmm_build |
+
+### Only needed if MAGPIE runs these tools itself
+
+These steps can be skipped by giving existing results (see
+[Reusing existing results](#reusing-existing-results)).
+
+| Tool | Conda package | Tested | Needed when | Reference data |
+|---|---|---|---|---|
+| GTDB-Tk | `gtdbtk` | 2.7.2 | `--gtdb-classify` is not given | GTDB-Tk reference package (about 140 GB, set `GTDBTK_DATA_PATH`); classify_wf needs about 128 GB RAM |
+| CheckM | `checkm-genome` | 1.2.5 | `--checkm-qa*` is not given | CheckM data (about 1.4 GB, set with `checkm data setRoot`); lineage_wf needs about 40 GB RAM |
+| eggNOG-mapper, with Prodigal and DIAMOND | `eggnog-mapper` | 2.1.13 | `--eggnog-data-dir` is given | eggNOG data (about 50 GB, `download_eggnog_data.py`) |
+
+Prodigal (2.6.3) and DIAMOND (2.2.8) are installed with the `eggnog-mapper` package.
+
+### Using the database
+
+PICRUSt2 2.6 or newer (tested with 2.6.3) is needed to run `run_picrust2.sh` and for
+`magpie install-picrust2-ref`. Install it in its own conda environment
+(`conda create -n picrust2 -c conda-forge -c bioconda picrust2`).
+
+The first step of `magpie run` (validate) checks that every tool needed by your run is on your
+`PATH` and stops with a list of missing tools if not.
+
+
 ### Notes on the method
 
 * The reference tree is an IQ-TREE tree of the 16S alignment (the PICRUSt2 developers prune the
